@@ -17,6 +17,10 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# SAPI Speak() flag: read the text as plain words. With flag 0, a message starting with "<" is parsed as SAPI
+# markup, so "!tts <silence msec=...>" could make minutes of dead air or <spell>/<pron> could dodge blocked words
+SVSF_IS_NOT_XML = 16
+
 class SAPI5Direct:
     """Direct SAPI5 control with output device selection"""
     
@@ -32,7 +36,8 @@ class SAPI5Direct:
         self.running = False
         self.worker_sapi = None
         self.stop_requested = False  # Flag to interrupt current speech
-        
+        self.worker_busy = False  # True while the worker is setting up or speaking a message
+
         try:
             # Initialize COM in main thread
             pythoncom.CoInitialize()
@@ -189,11 +194,16 @@ class SAPI5Direct:
             if not text:
                 return
                 
-            # Queue speech for worker thread
-            self.speech_queue.put(text)
-            
+            # Queue speech for worker thread, with the voice/output chosen for THIS message - the worker may not
+            # get to it until other messages have changed the current voice
+            self.speech_queue.put((text, self.current_voice_index, self.current_output_index))
+
         except Exception as e:
             logger.error(f"Failed to queue speech: {e}")
+
+    def is_busy(self):
+        """True while a message is being spoken or waiting in the worker's queue"""
+        return self.worker_busy or not self.speech_queue.empty()
             
     def speak_sync(self, text: str):
         """Speak text synchronously (blocks until complete)"""
@@ -205,7 +215,7 @@ class SAPI5Direct:
             self._ensure_voice()
             
             # Speak synchronously
-            self.sapi_voice.Speak(text, 0)  # 0 = synchronous
+            self.sapi_voice.Speak(text, SVSF_IS_NOT_XML)  # synchronous, plain text
             
         except Exception as e:
             logger.error(f"Failed to speak: {e}")
@@ -290,28 +300,44 @@ class SAPI5Direct:
             
         while self.running:
             try:
-                text = self.speech_queue.get(timeout=0.5)
-                
-                # Apply current audio output settings to worker SAPI
-                if self.current_output_index < len(self.audio_outputs):
-                    output = self.audio_outputs[self.current_output_index]
-                    if output['object'] and self.worker_sapi.AudioOutput != output['object']:
-                        self.worker_sapi.AudioOutput = output['object']
-                        logger.debug(f"Worker: Updated audio output to {output['name']}")
-                
-                # Apply current voice settings to worker SAPI
-                voices = self.worker_sapi.GetVoices()
-                if self.current_voice_index < voices.Count:
-                    self.worker_sapi.Voice = voices.Item(self.current_voice_index)
-                    logger.debug(f"Worker: Using voice {self.current_voice_index}")
-                
-                # Speak with worker's SAPI instance
-                self.worker_sapi.Speak(text, 0)  # Sync in worker thread
-                
+                item = self.speech_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
+
+            if isinstance(item, tuple):
+                text, voice_index, output_index = item
+            else:  # plain text queued by older callers: use whatever is current
+                text, voice_index, output_index = item, self.current_voice_index, self.current_output_index
+
+            self.worker_busy = True
+            try:
+                # Output and voice for this message. Kept apart from Speak so a voice that refuses to load
+                # (some IVONA voices do) or an unplugged device doesn't drop the message - it just uses the last one.
+                try:
+                    if output_index < len(self.audio_outputs):
+                        output = self.audio_outputs[output_index]
+                        if output['object'] and self.worker_sapi.AudioOutput != output['object']:
+                            self.worker_sapi.AudioOutput = output['object']
+                            logger.debug(f"Worker: Updated audio output to {output['name']}")
+
+                    voices = self.worker_sapi.GetVoices()
+                    if voice_index < voices.Count:
+                        self.worker_sapi.Voice = voices.Item(voice_index)
+                        logger.debug(f"Worker: Using voice {voice_index}")
+                except Exception as e:
+                    logger.warning(f"Worker: could not set voice/output, using the previous one: {e}")
+
+                # A !stop that landed while we were setting up should still stop this message
+                if self.stop_requested:
+                    continue
+
+                # Speak with worker's SAPI instance
+                self.worker_sapi.Speak(text, SVSF_IS_NOT_XML)  # Sync in worker thread, plain text
+
             except Exception as e:
                 logger.error(f"Worker error: {e}")
+            finally:
+                self.worker_busy = False
                 
     def get_voices(self):
         """Get available SAPI voices"""
@@ -516,15 +542,12 @@ class DirectOutputTTS:
         self.stop()
     
     def is_speaking(self):
-        """Check if currently speaking"""
-        # Check SAPI5 speaking status
-        if hasattr(self.sapi, 'voice') and self.sapi.voice:
-            try:
-                status = self.sapi.voice.Status
-                return status.RunningState == 2  # SRSEIsSpeaking = 2
-            except:
-                pass
-        
+        """Check if currently speaking (or has SAPI messages still waiting)"""
+        # SAPI5: the worker thread does the speaking. (This used to look for a self.sapi.voice that doesn't
+        # exist, so it always said False.)
+        if self.sapi and self.sapi.is_busy():
+            return True
+
         # Check DECtalk speaking status if available
         if self.dectalk_manager and hasattr(self.dectalk_manager, 'is_playing'):
             return self.dectalk_manager.is_playing

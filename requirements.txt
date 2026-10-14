@@ -1,3 +1,4 @@
 pywin32>=305
 pyaudio>=0.2.13
+numpy>=1.24
 pyinstaller>=6.0

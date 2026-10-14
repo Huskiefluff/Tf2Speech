@@ -9,11 +9,14 @@ from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
 
-# Base path - the TTS_TF2_FINAL directory
-project_root = Path(r'C:\TTS_TF2_FINAL - Copy')
+# Base path - this spec lives in build_specs\, so the project is one folder up (works wherever it's cloned)
+project_root = Path(SPECPATH).parent
 
-# Python 64-bit installation path
-python64_path = Path(r'C:\Python313')
+# git doesn't keep empty folders, so make sure the bundled temp folder exists on a fresh clone
+(project_root / 'voice_data' / 'temp').mkdir(parents=True, exist_ok=True)
+
+# The Python running PyInstaller (its Tcl/Tk files get bundled) - C:\Python313 on the original build PC
+python64_path = Path(sys.base_prefix)
 
 # Collect all tkinter submodules
 tkinter_modules = collect_submodules('tkinter')
@@ -105,6 +108,10 @@ a = Analysis(
         'dectalk_native',
         'sapi5_direct',
         'drg_monitor',  # New DRG monitor for Deep Rock Galactic support
+        'dj_player',  # DJ window (music + YouTube via ffmpeg/yt-dlp)
+        'soundboard',  # chat soundboard (Sven ChatSounds style)
+        'urllib.request',
+        'array',
     ],
     hookspath=[],
     hooksconfig={},
@@ -156,7 +163,7 @@ exe = EXE(
     upx=True,
     upx_exclude=['*.dll', 'tcl86t.dll', 'tk86t.dll'],  # Don't compress DLLs or Tk files
     runtime_tmpdir=None,  # Use default extraction (will use _MEIPASS)
-    console=True,
+    console=False,  # no cmd window; everything is still logged to tts_tf2.log next to the exe
     disable_windowed_traceback=False,
     argv_emulation=False,
     # Note: No target_arch specified - defaults to 64-bit on 64-bit Python

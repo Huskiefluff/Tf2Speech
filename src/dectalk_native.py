@@ -6,7 +6,7 @@ Uses actual DECtalk say.exe for authentic voice synthesis
 import os
 import sys
 import subprocess
-from temp_utils import get_temp_file, cleanup_old_temp_files
+from temp_utils import get_temp_file, cleanup_old_temp_files, release_temp_file
 import threading
 import queue
 import logging
@@ -25,6 +25,33 @@ logger = logging.getLogger(__name__)
 
 # CENTRALIZED VOICE DATA PATH
 VOICE_DATA_BASE = Path(r"\\HUSKIEFILES\Programs\Dev\tts\tts_tf2\tts voice data dectalk-acapela")
+
+def find_output_device(pa, device_name):
+    """(PyAudio index, real name) of the OUTPUT device that best matches device_name, or (None, None) to use the
+    system default. Input-only devices are skipped: virtual cables and headsets often give the mic and the
+    speaker the same name, and trying to play into the mic fails, so DECtalk would go silent.
+    Order: exact name, then a name containing it, then one it starts with (MME cuts names to 31 characters).
+    "VoiceMeeter Input (Recommended)" from the device list means the plain "VoiceMeeter Input", so it can't
+    land on "VoiceMeeter Aux Input" by accident."""
+    if not device_name or device_name.strip().lower() == 'default':
+        return None, None
+    wanted = device_name.lower().replace('(recommended)', '').strip()
+    outputs = []
+    for i in range(pa.get_device_count()):
+        info = pa.get_device_info_by_index(i)
+        if info.get('maxOutputChannels', 0) > 0:
+            outputs.append((i, info['name']))
+    for i, name in outputs:
+        if name.lower().strip() == wanted:
+            return i, name
+    for i, name in outputs:
+        if wanted in name.lower():
+            return i, name
+    for i, name in outputs:
+        if len(name) >= 12 and wanted.startswith(name.lower().strip()):
+            return i, name
+    return None, None
+
 
 class DECtalkNative:
     """Native DECtalk integration using say.exe"""
@@ -125,9 +152,10 @@ class DECtalkNative:
             else:
                 # Try to run it to see if it's in PATH
                 try:
-                    result = subprocess.run([path, "/?"], 
-                                          capture_output=True, 
-                                          timeout=1)
+                    result = subprocess.run([path, "/?"],
+                                          capture_output=True,
+                                          timeout=1,
+                                          creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
                     if result.returncode == 0:
                         return path
                 except:
@@ -138,6 +166,10 @@ class DECtalkNative:
     def is_available(self):
         """Check if DECtalk is available"""
         return self.available
+
+    def is_playing(self):
+        """True while a message is being generated or played (the DJ lowers the music meanwhile)"""
+        return self.current_stream is not None or self.current_process is not None
     
     def set_audio_device(self, device_name):
         """Set the audio output device for WAV playback"""
@@ -147,14 +179,13 @@ class DECtalkNative:
         if not self.pyaudio:
             self.pyaudio = pyaudio.PyAudio()
         
-        # Find device by name
-        for i in range(self.pyaudio.get_device_count()):
-            info = self.pyaudio.get_device_info_by_index(i)
-            if device_name.lower() in info['name'].lower():
-                self.audio_device_index = i
-                logger.info(f"DECtalk audio device set to: {info['name']}")
-                return True
-        
+        # Find the output device by name
+        index, name = find_output_device(self.pyaudio, device_name)
+        if index is not None:
+            self.audio_device_index = index
+            logger.info(f"DECtalk audio device set to: {name}")
+            return True
+
         logger.warning(f"Audio device not found: {device_name}")
         return False
     
@@ -401,17 +432,18 @@ class DECtalkNative:
             logger.error("DECtalk WAV generation timed out")
             if self.current_process:
                 self.current_process.kill()
+                try:
+                    self.current_process.wait(timeout=2)  # let it exit so it lets go of the WAV file
+                except Exception:
+                    pass
                 self.current_process = None
             return False
         except Exception as e:
             logger.error(f"DECtalk WAV generation error: {e}")
             return False
         finally:
-            # Clean up temporary file
-            try:
-                os.unlink(wav_path)
-            except:
-                pass
+            # Delete the WAV now (retries briefly if it's still held; otherwise it's removed at exit)
+            release_temp_file(wav_path)
     
     def _play_wav(self, wav_path, device_override=None, volume=1.0):
         """Play a WAV file to the specified audio device with volume control"""
@@ -423,11 +455,12 @@ class DECtalkNative:
             logger.warning("PyAudio not available, cannot play WAV file")
             return False
             
+        wf = None
         try:
             # Initialize PyAudio if needed
             if not self.pyaudio:
                 self.pyaudio = pyaudio.PyAudio()
-            
+
             # Open WAV file
             wf = wave.open(wav_path, 'rb')
             
@@ -439,23 +472,10 @@ class DECtalkNative:
             # Determine output device
             output_device = self.audio_device_index
             if device_override:
-                # Special handling for VoiceMeeter
-                if 'voicemeeter' in device_override.lower():
-                    # Look specifically for VoiceMeeter Input device
-                    for i in range(self.pyaudio.get_device_count()):
-                        info = self.pyaudio.get_device_info_by_index(i)
-                        if 'voicemeeter' in info['name'].lower() and 'input' in info['name'].lower():
-                            output_device = i
-                            logger.info(f"DECtalk routing to VoiceMeeter device: {info['name']} (index {i})")
-                            break
-                else:
-                    # Find device by name
-                    for i in range(self.pyaudio.get_device_count()):
-                        info = self.pyaudio.get_device_info_by_index(i)
-                        if device_override.lower() in info['name'].lower():
-                            output_device = i
-                            logger.info(f"DECtalk routing to device: {info['name']} (index {i})")
-                            break
+                index, name = find_output_device(self.pyaudio, device_override)
+                if index is not None:
+                    output_device = index
+                    logger.info(f"DECtalk routing to device: {name} (index {index})")
             
             # Open audio stream
             self.current_stream = self.pyaudio.open(
@@ -519,6 +539,12 @@ class DECtalkNative:
             
         except Exception as e:
             logger.error(f"WAV playback error: {e}")
+            # Close the WAV so it can be deleted (e.g. the output device couldn't be opened)
+            if wf is not None:
+                try:
+                    wf.close()
+                except Exception:
+                    pass
             return False
     
     def speak_async(self, text, voice_profile=None, use_wav=True, device_override=None, volume=1.0):

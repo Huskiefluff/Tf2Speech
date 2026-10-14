@@ -20,11 +20,23 @@ log_file = log_dir / 'tts_tf2.log'
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_file),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.FileHandler(log_file)]
+    # Console output only when there is a console (the windowed exe has none, so sys.stderr is None there)
+    + ([logging.StreamHandler()] if sys.stderr else [])
 )
+
+
+def show_fatal_error(error_msg):
+    """With no console window, a startup crash would otherwise vanish silently - show it in a pop-up"""
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("TTS TF2 - failed to start", error_msg[-1500:] + f"\n\nFull details are in {log_file}")
+        root.destroy()
+    except Exception:
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -74,10 +86,12 @@ def main():
         logger.error(error_msg)
         print(error_msg)
         print("\nThe GUI requires tkinter. You can run in test mode with: --test")
+        show_fatal_error(error_msg)
     except Exception as e:
         error_msg = f"Fatal error: {e}\n\nTraceback:\n{traceback.format_exc()}"
         logger.error(error_msg)
         print(error_msg)
+        show_fatal_error(error_msg)
 
 if __name__ == "__main__":
     main()

@@ -9,6 +9,8 @@ import os
 import time
 import logging
 import json
+import re
+import shutil
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 from pathlib import Path
@@ -23,7 +25,7 @@ try:
     from drg_monitor import DRGLogMonitor
     DRG_MONITOR_AVAILABLE = True
 except Exception as e:
-    logger.warning(f"DRG monitor not available: {e}")
+    logging.getLogger(__name__).warning(f"DRG monitor not available: {e}")  # module logger isn't set up yet
     DRG_MONITOR_AVAILABLE = False
     class DRGLogMonitor:
         def __init__(self, log_path):
@@ -41,24 +43,20 @@ else:
 
 # Configure logging FIRST - in exe directory
 log_file = log_dir / 'tts_tf2.log'
+# Console output only when there is a console (the windowed exe has none, so sys.stderr is None there)
+console_handlers = [logging.StreamHandler()] if sys.stderr else []
 try:
     logging.basicConfig(
         level=logging.DEBUG,  # More verbose for debugging
         format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler()
-        ]
+        handlers=[logging.FileHandler(log_file)] + console_handlers
     )
 except Exception as e:
     # Fallback if can't create log in exe dir
     logging.basicConfig(
         level=logging.DEBUG,
         format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler('tts_tf2.log'),
-            logging.StreamHandler()
-        ]
+        handlers=[logging.FileHandler('tts_tf2.log')] + console_handlers
     )
 
 logger = logging.getLogger(__name__)
@@ -78,6 +76,20 @@ logger.info("="*60)
 
 # Import SAPI5 
 from sapi5_direct import DirectOutputTTS
+
+# DJ music player and chat soundboard (optional - the TTS works without them)
+try:
+    from dj_player import DJEngine, DJWindow
+    DJ_AVAILABLE = True
+except Exception as e:
+    logger.warning(f"DJ player not available: {e}")
+    DJ_AVAILABLE = False
+try:
+    from soundboard import SoundboardEngine, SoundboardWindow
+    SOUNDBOARD_AVAILABLE = True
+except Exception as e:
+    logger.warning(f"Soundboard not available: {e}")
+    SOUNDBOARD_AVAILABLE = False
 
 # Try to import DECtalk native with fallback
 try:
@@ -126,6 +138,39 @@ class GameLogMonitor:
         if self.thread:
             self.thread.join(timeout=1)
 
+# Console lines that contain " : " but aren't chat, so they'd only clutter the chat window:
+# - the "status" command's server-info header, e.g. "version : 11117211/24 ..." or "udp/ip  : 1.2.3.4:27015"
+#   (TF2's own chat has two spaces after the colon, so a player actually named "map" still gets through)
+# - material errors, e.g. 'Error: Material "models/..." : proxy "..." unable to initialize!'
+NOT_CHAT = re.compile(r'^(?:(?:hostname|version|udp/ip|account|steamid|map|tags|players|edicts|sourcetv|replay)\s*: (?! )|Error: Material ")')
+
+# What TF2 puts in front of a chatter's name: "*DEAD* ", "*SPEC* ", "(TEAM) ", "*DEAD*(TEAM) ", "(Spectator) ".
+# Only stripped from the start of the line, so they can't hide inside a name (e.g. "(TEAM)AdminName")
+CHAT_PREFIX = re.compile(r'^(?:\*DEAD\*|\*SPEC\*)?(?:\(TEAM\)|\(Spectator\))?(?<=[*)]) ')
+
+# DECtalk markup: inline commands like [:np] [:phoneme on] [:t 430,500] [:dial 555], or phonemes with
+# timing like [dah<600,20>] / Moonbase-style [<500,20>]space. SAPI voices read these out as gibberish.
+# Command names are 2+ letters ([:np], [:rate 200]) or one letter plus numbers ([:t 430,500]), so smileys
+# like [:D] or [:P] don't count.
+DECTALK_MARKUP = re.compile(r'\[:\s*(?:[a-zA-Z]{2,}|[a-zA-Z]\s*\d)[^\]]*\]|\[[^\]]*<\d+(?:,\d+)?>')
+
+# Announcement texts for types added after people already had a config.json (used until they press Save
+# on the Announcements tab). Spoken as "<name> <text>".
+DEFAULT_ANNOUNCEMENTS = {
+    'MUTED': "has been muted",
+    'SPAM MUTED': "muted for spamming",
+}
+
+# Games every config starts with; any others are added by the user in Settings
+BUILTIN_GAME_NAMES = {'tf2': 'Team Fortress 2', 'drg': 'Deep Rock Galactic'}
+
+
+def spam_signature(text):
+    """Loose fingerprint for the spam guard: case and spacing ignored and long character runs shortened, so
+    "7777777777" and "77777777777777", or "aaaaaaa" and "aaaaaaaaaaaa", count as the same message"""
+    text = re.sub(r'\s+', ' ', text.lower()).strip()
+    return re.sub(r'(.)\1{2,}', r'\1\1\1', text)
+
 class TF2LogMonitor(GameLogMonitor):
     """Monitor TF2 log file - exact replica of old system behavior"""
     
@@ -141,17 +186,24 @@ class TF2LogMonitor(GameLogMonitor):
         line = line.strip()
         if not line:
             return None
-        
+
+        # Skip console lines that aren't chat (status server-info header, material errors)
+        if NOT_CHAT.match(line):
+            return None
+
         # Debug logging for !block commands
         if "!block" in line.lower():
             logger.info(f"LOG PARSER: Found !block in line: '{line}'")
             
-        # Match patterns from old system
-        is_dead = "*DEAD*" in line
-        is_team = "(TEAM)" in line
-        
+        # Chat prefix in front of the name (spectators included, so blocks/admins/voices still match them)
+        prefix_match = CHAT_PREFIX.match(line)
+        prefix = prefix_match.group(0) if prefix_match else ""
+        is_dead = "*DEAD*" in prefix
+        is_team = "(TEAM)" in prefix
+        is_spec = "*SPEC*" in prefix or "(Spectator)" in prefix
+
         # Clean line
-        clean = line.replace("*DEAD*", "").replace("(TEAM)", "").strip()
+        clean = line[len(prefix):].strip()
         
         # Extract username and message
         if " : " in clean:
@@ -169,6 +221,7 @@ class TF2LogMonitor(GameLogMonitor):
                     'message': message,
                     'is_dead': is_dead,
                     'is_team': is_team,
+                    'is_spec': is_spec,
                     'raw': line
                 }
         
@@ -227,9 +280,12 @@ class TTSReplicaWASAPI:
     """TTS GUI with WASAPI audio routing"""
     
     def __init__(self):
+        self._config_lock = threading.RLock()  # save_config is called from the GUI, chat and speech threads
+        # Clear temp leftovers from earlier runs (crash/force-close) in the background so startup isn't slowed
+        threading.Thread(target=self.cleanup_leftover_temp, daemon=True).start()
         self.config = self.load_config()
         self.monitors = {}  # Dictionary to hold monitors for each game
-        self.current_game = self.config.get('current_game', 'tf2')
+        self.current_game = self.normalize_game_name(self.config.get('current_game', 'Team Fortress 2'))
         self.audio_manager = None
         self.is_running = False
         
@@ -238,15 +294,26 @@ class TTSReplicaWASAPI:
         
         # Game configurations
         self.game_configs = self.init_game_configs()
-        
+        # If the saved game was removed (or is an old 'tf2' style name), land on a game that exists
+        self.current_game = self.game_configs[self.current_game_key()]['name']
+
         # Track last speaker for admin commands (per game)
         self.last_speakers = {'tf2': None, 'drg': None}
         
+        # GUI updates requested from the chat/speech/DJ threads; pump_ui_calls runs them on the GUI thread
+        # (Tk isn't thread-safe, so nothing outside the GUI thread touches widgets directly)
+        self._ui_calls = queue.Queue()
+        self.dj = None          # DJ player, started after the window is built
+        self.dj_window = None
+        self.soundboard = None  # chat soundboard, same
+        self.soundboard_window = None
+
         # Message queue for sequential playback
         self.message_queue = queue.Queue()
         self.queue_thread = None
         self.queue_running = False
         self.currently_speaking_user = None
+        self.last_speaker = None  # last player to use TTS (for !block / !admin add / !mute)
         self.current_voice_id = None  # Cache current voice to avoid unnecessary changes
         
         # Voice command mappings - will be populated with actual system voices
@@ -275,7 +342,12 @@ class TTSReplicaWASAPI:
         
         # User voice preferences - username -> voice name/id
         self.user_voice_preferences = self.config.get('user_voice_preferences', {})
-        
+
+        # Temporary mutes: username -> time the mute ends (kept across restarts, oldest mute first)
+        self._mute_lock = threading.Lock()
+        self.muted_users = {u: t for u, t in self.config.get('muted_users', {}).items() if t > time.time()}
+        self.spam_history = {}  # username -> recent [(time, spam_signature)] of their TTS messages
+
         # Random voice for new users
         self.random_voice_enabled = self.config.get('random_voice_enabled', False)
         self.random_voice_exclusions = self.config.get('random_voice_exclusions', [])
@@ -289,7 +361,9 @@ class TTSReplicaWASAPI:
         if not self.dectalk_profiles:
             self.dectalk_profiles = self.get_default_dectalk_profiles()
         self.dectalk_enabled = self.config.get('dectalk_enabled', True)  # Default to True so DECtalk is available
-        
+        # Plain float copy of the DECtalk volume slider for the speech thread (Tk variables aren't thread-safe)
+        self.dectalk_volume = float(self.config.get('dectalk_volume', 0.7))
+
         # Now initialize audio AFTER all required attributes are set
         self.init_audio()
         
@@ -305,7 +379,37 @@ class TTSReplicaWASAPI:
         
         self.setup_gui()
         self.load_settings()
-        
+
+        # Keep the MUTED list's "min left" current and drop mutes that have run out
+        self.refresh_muted_list()
+        self.root.after(30000, self.tick_mutes)
+        self.root.after(100, self.pump_ui_calls)
+
+        # DJ music player: the window opens from the 🎵 DJ button; music keeps playing when it's closed
+        self.dj = None
+        self.dj_window = None
+        if DJ_AVAILABLE:
+            try:
+                self.dj = DJEngine(self.config.setdefault('dj', {}), save_config=self.save_config,
+                                   tts_active=self.is_tts_audio_active, announce=self.announce_now_playing,
+                                   tts_device=lambda: self.config.get('audio_device', 'Default'),
+                                   app_dir=self.get_config_path().parent)
+            except Exception as e:
+                logger.error(f"DJ player failed to start: {e}")
+
+        # Chat soundboard: sounds in the "sounds" folder next to the TTS, triggered from chat
+        if SOUNDBOARD_AVAILABLE:
+            try:
+                # same ffmpeg/ffprobe lookup as the DJ (settings path, next to the TTS, then PATH)
+                finder = (lambda name: (getattr(self.dj, f'{name}_path')() if self.dj else shutil.which(name)))
+                self.soundboard = SoundboardEngine(self.config.setdefault('soundboard', {}), save_config=self.save_config,
+                                                   sounds_dir=self.get_config_path().parent / 'sounds',
+                                                   tts_device=lambda: self.config.get('audio_device', 'Default'),
+                                                   ffmpeg_path=lambda: finder('ffmpeg'),
+                                                   ffprobe_path=lambda: finder('ffprobe'))
+            except Exception as e:
+                logger.error(f"Soundboard failed to start: {e}")
+
         # Auto-generate voice commands if empty
         if not self.voice_commands or all(not v for v in self.voice_commands.values()):
             self.auto_generate_voice_commands()
@@ -327,6 +431,9 @@ class TTSReplicaWASAPI:
             logger.info("Initializing DECtalk for audio manager...")
             self.dectalk_native = DECtalkNative()
             logger.info(f"DECtalk native available after re-init: {self.dectalk_native.is_available()}")
+            # Ensure the freshly-created engine uses the user's profiles, not its hardcoded defaults
+            if hasattr(self, 'dectalk_profiles') and self.dectalk_profiles:
+                self.dectalk_native.voice_profiles = self.dectalk_profiles
             logger.info(f"DECtalk native path: {self.dectalk_native.dectalk_path}")
             
             self.dectalk_manager = DECtalkManager(self.audio_manager)
@@ -400,12 +507,19 @@ class TTSReplicaWASAPI:
         
         # Get config path
         config_path = self.get_config_path()
-        
-        if config_path.exists():
+        backup_path = config_path.with_name(config_path.name + '.bak')
+
+        # Try config.json, then the copy save_config keeps of the previous version
+        for path in (config_path, backup_path):
+            if not path.exists():
+                continue
             try:
-                with open(config_path, 'r') as f:
+                with open(path, 'r') as f:
                     user_config = json.load(f)
-                    
+
+                    if path == backup_path:
+                        logger.warning(f"Loaded settings from {backup_path.name}")
+
                     # Merge with defaults (user config takes precedence)
                     config = self.merge_configs(default_config, user_config)
                     
@@ -426,8 +540,16 @@ class TTSReplicaWASAPI:
                     
                     return config
             except Exception as e:
-                logger.error(f"Error loading config: {e}")
-        
+                logger.error(f"Error loading config {path.name}: {e}")
+                if path == config_path:
+                    # Move the unreadable file aside so the next save can't overwrite your settings with defaults
+                    corrupt_path = config_path.with_name(f"config_unreadable_{time.strftime('%Y%m%d_%H%M%S')}.json")
+                    try:
+                        os.replace(config_path, corrupt_path)
+                        logger.error(f"Moved unreadable config to {corrupt_path.name}")
+                    except Exception as move_error:
+                        logger.error(f"Could not move unreadable config aside: {move_error}")
+
         # Return default config for new users
         logger.info("No config found, using defaults")
         return default_config
@@ -443,27 +565,45 @@ class TTSReplicaWASAPI:
         return result
     
     def init_game_configs(self):
-        """Initialize game configurations"""
-        games = self.config.get('games', {})
-        
-        # Ensure we have configs for both games
-        if 'tf2' not in games:
+        """Initialize game configurations. Each game: name (shown in Settings), type ('source' = Source engine
+        console log, 'drg' = Deep Rock Galactic chat mod CSV), log_path, admins, blocked, tts_command_prefix."""
+        # Same dict object as config['games'], so edits here are what gets saved
+        games = self.config.setdefault('games', {})
+
+        # A fresh config starts with the two built-in games (they can be removed later in Settings)
+        if not games:
             games['tf2'] = {
                 'log_path': self.config.get('log_path', ''),
                 'admins': self.config.get('admins', []),
                 'blocked': self.config.get('blocked', []),
                 'last_position': 0
             }
-        
-        if 'drg' not in games:
             games['drg'] = {
                 'log_path': '',
                 'admins': [],
                 'blocked': [],
                 'last_line_index': -1
             }
-        
+
+        for key, game in games.items():
+            game.setdefault('name', BUILTIN_GAME_NAMES.get(key, key))
+            game.setdefault('type', 'drg' if key == 'drg' else 'source')
+
         return games
+
+    def game_key_for(self, name):
+        """Config key of the game with this display name (falls back to the first game)"""
+        for wanted in (name, self.normalize_game_name(name)):
+            for key, game in self.game_configs.items():
+                if game.get('name') == wanted:
+                    return key
+        return next(iter(self.game_configs), 'tf2')
+
+    def current_game_key(self):
+        return self.game_key_for(self.current_game)
+
+    def game_names(self):
+        return [game.get('name', key) for key, game in self.game_configs.items()]
     
     def migrate_config(self, config):
         """Migrate old config format to new multi-game format"""
@@ -484,8 +624,8 @@ class TTSReplicaWASAPI:
                 }
             }
             
-            # Set current game
-            config['current_game'] = 'tf2'
+            # Set current game (the display name - everything else compares against 'Team Fortress 2')
+            config['current_game'] = 'Team Fortress 2'
             
             # Remove old format keys
             for key in ['log_path', 'tf2', 'tf2_log_path']:
@@ -493,23 +633,98 @@ class TTSReplicaWASAPI:
         
         return config
     
+    def run_on_gui(self, func):
+        """Have func run on the GUI thread shortly. Safe from any thread."""
+        self._ui_calls.put(func)
+
+    def pump_ui_calls(self):
+        """GUI thread, every 100 ms: run the updates other threads asked for, in order"""
+        while True:
+            try:
+                func = self._ui_calls.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                func()
+            except Exception as e:
+                logger.error(f"GUI update failed: {e}")
+        self.root.after(100, self.pump_ui_calls)
+
+    def open_dj_window(self):
+        """🎵 DJ button"""
+        if not self.dj:
+            messagebox.showerror("DJ", "The DJ player couldn't start - see tts_tf2.log for why")
+            return
+        if self.dj_window:
+            self.dj_window.lift()
+            return
+        voices = lambda: list(self.longform_voice_combo['values']) if hasattr(self, 'longform_voice_combo') else ['Default']
+        self.dj_window = DJWindow(self.root, self.dj, voice_names=voices,
+                                  on_close=lambda: setattr(self, 'dj_window', None))
+
+    def open_soundboard_window(self):
+        """🔊 Sounds button"""
+        if not self.soundboard:
+            messagebox.showerror("Soundboard", "The soundboard couldn't start - see tts_tf2.log for why")
+            return
+        if self.soundboard_window:
+            self.soundboard_window.lift()
+            return
+        self.soundboard_window = SoundboardWindow(self.root, self.soundboard, tools=self.dj,
+                                                  on_close=lambda: setattr(self, 'soundboard_window', None))
+
+    def is_tts_audio_active(self):
+        """For DJ ducking: is a TTS voice talking right now - or a soundboard sound, if the soundboard is set to
+        lower the music? (called from the DJ thread ~20 times a second)"""
+        sb = getattr(self, 'soundboard', None)
+        if sb and sb.get('duck_music') and sb.is_playing():
+            return True
+        try:
+            if self.audio_manager and self.audio_manager.is_speaking():
+                return True
+        except Exception:
+            pass
+        dectalk = getattr(self, 'dectalk_native', None)
+        return bool(dectalk and hasattr(dectalk, 'is_playing') and dectalk.is_playing())
+
+    def announce_now_playing(self, text, track):
+        """DJ "now playing" through the TTS - only while the TTS is started (nothing else empties the queue)"""
+        if not self.is_running:
+            return
+        voice = self.config.get('dj', {}).get('announce_voice', 'Default')
+        if not voice or voice == 'Default':
+            voice = self.config.get('announcement_voice', '')
+        self.message_queue.put({'text': text, 'voice': voice, 'username': '__announcement__'})
+
+    def cleanup_leftover_temp(self):
+        """Old unpack folders and stray DECtalk WAVs from earlier runs"""
+        try:
+            from temp_utils import cleanup_orphaned_bundle_dirs, cleanup_old_temp_files
+            cleanup_orphaned_bundle_dirs()
+            cleanup_old_temp_files(max_age_hours=1)
+        except Exception as e:
+            logger.warning(f"Temp cleanup skipped: {e}")
+
+    def normalize_game_name(self, name):
+        """Older configs stored 'tf2'/'drg', but the code compares against the display names"""
+        return {'tf2': 'Team Fortress 2', 'drg': 'Deep Rock Galactic', '': 'Team Fortress 2'}.get(name or '', name)
+
     def get_current_game_config(self):
         """Get config for currently selected game"""
-        game_key = 'tf2' if self.current_game == 'Team Fortress 2' else 'drg'
+        game_key = self.current_game_key()
         return self.game_configs.get(game_key, {})
     
     def on_game_changed(self, event=None):
         """Handle game selection change"""
-        # Save current game's log path before switching
-        old_game_key = 'tf2' if self.current_game == 'Team Fortress 2' else 'drg'
-        if hasattr(self, 'log_path_var'):
+        # Save current game's log path before switching (unless that game was just removed)
+        old_game_key = self.current_game_key()
+        if hasattr(self, 'log_path_var') and self.game_configs.get(old_game_key, {}).get('name') == self.current_game:
             current_log_path = self.log_path_var.get()
             if current_log_path:
                 self.game_configs[old_game_key]['log_path'] = current_log_path
-                self.config['games'][old_game_key]['log_path'] = current_log_path
         
         selected_game = self.game_combo.get()
-        game_key = 'tf2' if selected_game == 'Team Fortress 2' else 'drg'
+        game_key = self.game_key_for(selected_game)
         
         # Stop current monitor
         if self.is_running:
@@ -548,7 +763,138 @@ class TTSReplicaWASAPI:
         self.save_config()
         
         logger.info(f"Switched to game: {selected_game}")
-    
+
+    def add_game(self):
+        """+ Add Game button"""
+        self.open_game_dialog(None)
+
+    def edit_game(self):
+        """✎ Edit button: the game picked in the Game box"""
+        self.open_game_dialog(self.game_key_for(self.game_combo.get()))
+
+    def open_game_dialog(self, game_key):
+        """Add a game (game_key None) or edit one: name, log type, log file, TTS command"""
+        editing = game_key is not None
+        game = self.game_configs.get(game_key, {}) if editing else {}
+        type_labels = {
+            'source': "Source game console log (TF2, L4D2, GMod, CS:S, HL2DM...)",
+            'drg': "Deep Rock Galactic chat log mod",
+        }
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Edit Game" if editing else "Add Game")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        frame = ttk.Frame(dialog, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame, text="Name").grid(row=0, column=0, sticky=tk.W, pady=4)
+        name_var = tk.StringVar(value=game.get('name', ''))
+        ttk.Entry(frame, textvariable=name_var, width=50).grid(row=0, column=1, sticky=tk.W, pady=4)
+
+        ttk.Label(frame, text="Log type").grid(row=1, column=0, sticky=tk.W, pady=4)
+        type_combo = ttk.Combobox(frame, values=list(type_labels.values()), state='readonly', width=48)
+        type_combo.set(type_labels.get(game.get('type', 'source'), type_labels['source']))
+        type_combo.grid(row=1, column=1, sticky=tk.W, pady=4)
+
+        ttk.Label(frame, text="Log file").grid(row=2, column=0, sticky=tk.W, pady=4)
+        path_var = tk.StringVar(value=game.get('log_path', ''))
+        ttk.Entry(frame, textvariable=path_var, width=50).grid(row=2, column=1, sticky=tk.W, pady=4)
+
+        def browse():
+            path = filedialog.askopenfilename(parent=dialog, title="Pick the game's log file",
+                                              filetypes=[("Log files", "*.txt *.log *.csv"), ("All files", "*.*")])
+            if path:
+                path_var.set(path)
+        ttk.Button(frame, text="Browse...", command=browse).grid(row=2, column=2, padx=5, pady=4)
+
+        ttk.Label(frame, text="TTS command").grid(row=3, column=0, sticky=tk.W, pady=4)
+        prefix_var = tk.StringVar(value=game.get('tts_command_prefix', '!tts'))
+        ttk.Entry(frame, textvariable=prefix_var, width=15).grid(row=3, column=1, sticky=tk.W, pady=4)
+
+        ttk.Label(frame, foreground='gray', justify=tk.LEFT, text=(
+            "Source games: add  con_logfile log.txt  to that game's autoexec.cfg (in its cfg folder),\n"
+            "then pick the log.txt it creates in the game's mod folder, e.g. ...\\left4dead2\\log.txt.\n"
+            + ("" if editing else "A new game starts with this game's admins and an empty blocked list.")
+        )).grid(row=4, column=0, columnspan=3, sticky=tk.W, pady=(8, 4))
+
+        def save():
+            name = name_var.get().strip()
+            if not name:
+                messagebox.showwarning("Game", "Give the game a name", parent=dialog)
+                return
+            if any(g.get('name') == name for k, g in self.game_configs.items() if k != game_key):
+                messagebox.showwarning("Game", f"There's already a game called {name}", parent=dialog)
+                return
+            game_type = next(k for k, label in type_labels.items() if label == type_combo.get())
+            is_current = editing and game.get('name') == self.current_game
+
+            if editing:
+                target = self.game_configs[game_key]
+                key = game_key
+            else:
+                base = re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_') or 'game'
+                key, n = base, 2
+                while key in self.game_configs:
+                    key, n = f"{base}_{n}", n + 1
+                admins = [self.admin_listbox.get(i) for i in range(self.admin_listbox.size())]
+                target = self.game_configs[key] = {'admins': admins, 'blocked': [], 'last_position': 0}
+            target.update({
+                'name': name,
+                'type': game_type,
+                'log_path': path_var.get().strip(),
+                'tts_command_prefix': prefix_var.get().strip() or '!tts',
+            })
+            if key == 'tf2':
+                self.config['log_path'] = target['log_path']  # legacy location
+
+            self.game_combo['values'] = self.game_names()
+            if is_current:
+                # Renamed or re-pointed the game in use: refresh the Settings fields (and restart if running)
+                was_running = self.is_running
+                if was_running:
+                    self.stop_tts()
+                self.current_game = name
+                self.config['current_game'] = name
+                self.game_combo.set(name)
+                self.log_path_var.set(target['log_path'])
+                self.tts_prefix_entry.delete(0, tk.END)
+                self.tts_prefix_entry.insert(0, target['tts_command_prefix'])
+                if was_running:
+                    self.start_tts()
+            self.save_config()
+            logger.info(f"{'Edited' if editing else 'Added'} game {name} ({key}, {game_type})")
+            dialog.destroy()
+
+        btns = ttk.Frame(frame)
+        btns.grid(row=5, column=0, columnspan=3, pady=(8, 0))
+        ttk.Button(btns, text="Save", command=save).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btns, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+
+    def remove_game(self):
+        """✖ Remove button: delete the game picked in the Game box, with its lists and settings"""
+        name = self.game_combo.get()
+        key = self.game_key_for(name)
+        if len(self.game_configs) <= 1:
+            messagebox.showwarning("Remove Game", "You need at least one game")
+            return
+        if not messagebox.askyesno("Remove Game", f"Remove {name}?\n\nIts log path, admins, blocked list and TTS command go with it."):
+            return
+        if self.is_running and name == self.current_game:
+            self.stop_tts()
+        del self.game_configs[key]
+        self.game_combo['values'] = self.game_names()
+        logger.info(f"Removed game {name} ({key})")
+        if name == self.current_game:
+            # Switch to the first remaining game; current_game is cleared so its log path isn't saved
+            # into the removed game
+            self.current_game = ''
+            self.game_combo.set(self.game_names()[0])
+            self.on_game_changed()
+        else:
+            self.game_combo.set(self.current_game)
+            self.save_config()
+
     def auto_generate_voice_commands(self):
         """Auto-generate voice commands from available voices"""
         logger.info("Auto-generating voice commands...")
@@ -603,15 +949,29 @@ class TTSReplicaWASAPI:
         # Checkboxes for sections
         export_options = {}
         sections = [
-            ('games', 'Game Settings (log paths, admins, blocked)'),
-            ('voices', 'Voice Settings'),
-            ('voice_commands', 'Voice Commands'),
-            ('user_voices', 'User Voice Preferences'),
+            ('games', 'Games (log paths, admins, blocked lists, TTS commands)'),
+            ('voices', 'Voice settings (default voice, hidden voices, DECtalk profiles, random voices)'),
+            ('voice_commands', 'Voice commands'),
+            ('user_voices', 'User voices (each player\'s voice)'),
             ('announcements', 'Announcements'),
-            ('auto_block', 'Auto-block Settings'),
-            ('ui', 'UI Settings (collapsed states)'),
-            ('audio_device', 'Audio Device Settings')
+            ('auto_block', 'Auto-block words'),
+            ('ui', 'Everything else (private mode, mutes, DJ, soundboard...)'),
+            ('audio_device', 'Audio device')
         ]
+        # The config keys behind each checkbox (the old export looked for keys named after the checkboxes,
+        # which mostly don't exist, so user voices, auto-block words, DECtalk profiles... were never exported)
+        section_keys = {
+            'games': ['games', 'current_game', 'admins', 'blocked', 'log_path'],
+            'voices': ['default_voice', 'hidden_voices', 'dectalk_profiles', 'dectalk_volume', 'dectalk_enabled',
+                       'random_voice_enabled', 'random_voice_exclusions', 'voice_toggle_command'],
+            'voice_commands': ['voice_commands'],
+            'user_voices': ['user_voice_preferences'],
+            'announcements': ['announcements', 'announcement_enabled', 'announcement_voice'],
+            'auto_block': ['auto_block', 'auto_block_enabled', 'auto_block_keywords'],
+            'audio_device': ['audio_device'],
+        }
+        named = {k for keys in section_keys.values() for k in keys}
+        section_keys['ui'] = [k for k in self.config if k not in named]
         
         for key, label in sections:
             var = tk.BooleanVar(value=True)
@@ -629,9 +989,11 @@ class TTSReplicaWASAPI:
                 try:
                     # Build export config with selected sections
                     export_config = {'version': '2.0'}
-                    for key, var in export_options.items():
-                        if var.get() and key in self.config:
-                            export_config[key] = self.config[key]
+                    for section, var in export_options.items():
+                        if var.get():
+                            for key in section_keys[section]:
+                                if key in self.config:
+                                    export_config[key] = self.config[key]
                     
                     with open(file_path, 'w') as f:
                         json.dump(export_config, f, indent=2)
@@ -653,6 +1015,7 @@ class TTSReplicaWASAPI:
         )
         
         if file_path:
+            old_config = self.config
             try:
                 # Create backup of current config
                 backup_path = self.get_config_path().parent / f"config_backup_{time.strftime('%Y%m%d_%H%M%S')}.json"
@@ -662,21 +1025,17 @@ class TTSReplicaWASAPI:
                 
                 with open(file_path, 'r') as f:
                     imported_config = json.load(f)
-                
-                # Merge with defaults to ensure all required fields exist
-                if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-                    default_config_path = Path(sys._MEIPASS) / 'default_config.json'
-                else:
-                    default_config_path = Path(__file__).parent / 'default_config.json'
-                
-                if default_config_path.exists():
-                    with open(default_config_path, 'r') as f:
-                        default_config = json.load(f)
-                    self.config = self.merge_configs(default_config, imported_config)
-                else:
-                    self.config = imported_config
-                
+                if not isinstance(imported_config, dict):
+                    raise ValueError("that file isn't a TTS config")
+                imported_config.pop('version', None)
+
+                # Merge INTO the current settings: an export of only some sections changes only those, and
+                # nothing the file doesn't mention gets wiped (replacing the whole config used to do that)
+                current = json.loads(json.dumps(self.config))  # deep copy
+                self.config = self.merge_configs(current, imported_config)
+
                 # Save and reload
+                self.apply_config()
                 self.save_config()
                 self.load_settings()
                 
@@ -684,6 +1043,14 @@ class TTSReplicaWASAPI:
                                   "Config imported successfully.\nSome settings may require restart.")
                 logger.info(f"Config imported from {file_path}")
             except Exception as e:
+                # Don't leave a half-applied import live (the next save would write it out)
+                if self.config is not old_config:
+                    self.config = old_config
+                    try:
+                        self.apply_config()
+                        self.load_settings()
+                    except Exception as restore_error:
+                        logger.error(f"Failed to restore settings after import error: {restore_error}")
                 messagebox.showerror("Import Failed", f"Failed to import config:\n{e}")
                 logger.error(f"Failed to import config: {e}")
     
@@ -699,35 +1066,128 @@ class TTSReplicaWASAPI:
             else:
                 default_config_path = Path(__file__).parent / 'default_config.json'
             
-            if default_config_path.exists():
-                try:
+            try:
+                # Back up the current settings first, same as Import does
+                backup_path = self.get_config_path().parent / f"config_backup_{time.strftime('%Y%m%d_%H%M%S')}.json"
+                with open(backup_path, 'w') as f:
+                    json.dump(self.config, f, indent=2)
+                logger.info(f"Created config backup at {backup_path}")
+
+                # default_config.json isn't shipped, so without it "defaults" means a fresh, empty config
+                if default_config_path.exists():
                     with open(default_config_path, 'r') as f:
                         self.config = json.load(f)
-                    
-                    # Preserve TF2 log path if it exists
-                    current_log = self.log_path_var.get()
-                    if current_log and Path(current_log).exists():
-                        self.config['log_path'] = current_log
-                    
-                    self.save_config()
-                    self.load_settings()
-                    
-                    messagebox.showinfo("Reset Complete", "Settings reset to defaults.")
-                    logger.info("Config reset to defaults")
-                except Exception as e:
-                    messagebox.showerror("Reset Failed", f"Failed to reset config:\n{e}")
-                    logger.error(f"Failed to reset config: {e}")
+                else:
+                    self.config = {}
+
+                # Preserve TF2 log path if it exists
+                current_log = self.log_path_var.get()
+                if current_log and Path(current_log).exists():
+                    self.config['log_path'] = current_log
+
+                self.apply_config()
+                self.save_config()
+                self.load_settings()
+
+                messagebox.showinfo("Reset Complete", f"Settings reset to defaults.\nYour old settings were saved to {backup_path.name}")
+                logger.info("Config reset to defaults")
+            except Exception as e:
+                messagebox.showerror("Reset Failed", f"Failed to reset config:\n{e}")
+                logger.error(f"Failed to reset config: {e}")
     
         
     def save_config(self):
-        """Save config"""
+        """Save config: one save at a time, written to a temp file and swapped in (a crash mid-save can't
+        leave a half-written config.json), with the previous version kept as config.json.bak"""
         config_path = self.get_config_path()
-        
-        try:
-            with open(config_path, 'w') as f:
-                json.dump(self.config, f, indent=2)
-        except Exception as e:
-            logger.error(f"Failed to save config: {e}")
+
+        with self._config_lock:
+            try:
+                # Chat/speech threads can change settings while we serialize; retry if a dict changes mid-way
+                data = None
+                for attempt in range(5):
+                    try:
+                        data = json.dumps(self.config, indent=2)
+                        break
+                    except RuntimeError:
+                        time.sleep(0.02)
+                if data is None:
+                    logger.error("Failed to save config: settings kept changing during save")
+                    return
+
+                tmp_path = config_path.with_name(config_path.name + '.tmp')
+                with open(tmp_path, 'w') as f:
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                if config_path.exists():
+                    shutil.copy2(config_path, config_path.with_name(config_path.name + '.bak'))
+                os.replace(tmp_path, config_path)
+            except Exception as e:
+                logger.error(f"Failed to save config: {e}")
+
+    def apply_config(self):
+        """Re-read the in-memory settings from self.config. Import/Reset/Reload replace self.config, and
+        without this the next save would write the old voices, commands and lists straight back."""
+        self.current_game = self.normalize_game_name(self.config.get('current_game', 'Team Fortress 2'))
+        self.hidden_voices = self.config.get('hidden_voices', [])
+        self.game_configs = self.init_game_configs()
+        self.current_game = self.game_configs[self.current_game_key()]['name']
+        if getattr(self, 'dj', None):
+            self.dj.settings = self.config.setdefault('dj', {})  # the queue in memory is written into it on the next change
+        if getattr(self, 'soundboard', None):
+            self.soundboard.settings = self.config.setdefault('soundboard', {})
+        with self._mute_lock:
+            self.muted_users = {u: t for u, t in self.config.get('muted_users', {}).items() if t > time.time()}
+        self.voice_commands = self.config.get('voice_commands', {})
+        self.user_voice_preferences = self.config.get('user_voice_preferences', {})
+        self.random_voice_enabled = self.config.get('random_voice_enabled', False)
+        self.random_voice_exclusions = self.config.get('random_voice_exclusions', [])
+        self.voice_toggle_command = self.config.get('voice_toggle_command', '/vt')
+        self.dectalk_profiles = self.config.get('dectalk_profiles') or self.get_default_dectalk_profiles()
+        self.dectalk_enabled = self.config.get('dectalk_enabled', True)
+
+        # Refresh the widgets that show these (load_settings handles the rest)
+        if hasattr(self, 'game_combo'):
+            self.game_combo['values'] = self.game_names()
+            self.game_combo.set(self.current_game)
+        if hasattr(self, 'spam_mute_var'):
+            self.spam_mute_var.set(self.config.get('spam_mute_enabled', True))
+            self.mute_minutes_var.set(str(self.config.get('mute_minutes', 10)))
+            self.refresh_muted_list()
+        # Auto-block words and announcement fields always show the new config (load_settings skips an
+        # empty keyword list), so a later Save can't write the old values back
+        if hasattr(self, 'auto_block_text'):
+            self.auto_block_text.delete(1.0, tk.END)
+            self.auto_block_text.insert(1.0, '\n'.join(self.config.get('auto_block_keywords', [])))
+        announcements = self.config.get('announcements') or {}
+        for key, var in getattr(self, 'announcement_vars', {}).items():
+            var.set(announcements.get(key, getattr(self, 'announcement_defaults', {}).get(key, '')))
+        enabled = self.config.get('announcement_enabled', {})
+        for label, var in getattr(self, 'announcement_enabled_vars', {}).items():
+            var.set(enabled.get(label, True))
+        if hasattr(self, 'announcement_voice_combo') and self.config.get('announcement_voice'):
+            self.announcement_voice_combo.set(self.config['announcement_voice'])
+        if hasattr(self, 'random_voice_var'):
+            self.random_voice_var.set(self.random_voice_enabled)
+        if hasattr(self, 'voice_toggle_entry'):
+            self.voice_toggle_entry.delete(0, tk.END)
+            self.voice_toggle_entry.insert(0, self.voice_toggle_command)
+        self.dectalk_volume = float(self.config.get('dectalk_volume', 0.7))
+        if hasattr(self, 'dectalk_volume_var'):
+            self.dectalk_volume_var.set(self.dectalk_volume)
+        if hasattr(self, 'tts_prefix_entry'):
+            self.tts_prefix_entry.delete(0, tk.END)
+            self.tts_prefix_entry.insert(0, self.get_current_game_config().get('tts_command_prefix', '!tts'))
+        if hasattr(self, 'dectalk_profiles_listbox'):
+            self.refresh_dectalk_profiles()
+        if not self.voice_commands or all(not v for v in self.voice_commands.values()):
+            self.auto_generate_voice_commands()
+        if hasattr(self, 'voice_tree'):
+            for item in self.voice_tree.get_children():
+                self.voice_tree.delete(item)
+            for cmd, voice in self.voice_commands.items():
+                self.voice_tree.insert('', tk.END, values=(cmd, voice), tags=(cmd,))
     
     def on_random_voice_toggle(self):
         """Handle random voice toggle change"""
@@ -871,8 +1331,11 @@ class TTSReplicaWASAPI:
         self.reload_btn = ttk.Button(button_frame, text="Reload TTS", command=self.reload_tts)
         self.reload_btn.pack(side=tk.LEFT, padx=2)
         
-        self.test_audio_btn = ttk.Button(button_frame, text="Test Audio", command=self.test_audio_device)
-        self.test_audio_btn.pack(side=tk.LEFT, padx=2)
+        self.dj_btn = ttk.Button(button_frame, text="🎵 DJ", command=self.open_dj_window)
+        self.dj_btn.pack(side=tk.LEFT, padx=2)
+
+        self.soundboard_btn = ttk.Button(button_frame, text="🔊 Sounds", command=self.open_soundboard_window)
+        self.soundboard_btn.pack(side=tk.LEFT, padx=2)
         
         # Chat display
         self.chat_display = scrolledtext.ScrolledText(left_frame, height=15, width=50)
@@ -909,7 +1372,34 @@ class TTSReplicaWASAPI:
         ttk.Button(blocked_btn_frame, text="✓ Save", command=self.save_blocked).pack(side=tk.LEFT, padx=2)
         ttk.Button(blocked_btn_frame, text="✖ Remove", command=self.remove_blocked).pack(side=tk.LEFT, padx=2)
         ttk.Button(blocked_btn_frame, text="+ Add", command=self.add_blocked).pack(side=tk.LEFT, padx=2)
-        
+
+        # MUTED section - temporary mutes from !mute, the spam guard, or + Mute here
+        muted_label = ttk.Label(right_frame, text="MUTED", font=('Arial', 10, 'bold'))
+        muted_label.pack(pady=(10, 0))
+
+        self.muted_listbox = tk.Listbox(right_frame, height=4, width=30)
+        self.muted_listbox.pack(pady=5)
+        self.muted_listbox_names = []  # usernames in the same order as the listbox rows
+
+        muted_btn_frame = ttk.Frame(right_frame)
+        muted_btn_frame.pack()
+
+        ttk.Button(muted_btn_frame, text="✖ Unmute", command=self.unmute_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(muted_btn_frame, text="+ Mute", command=self.add_mute).pack(side=tk.LEFT, padx=2)
+
+        mute_opts_frame = ttk.Frame(right_frame)
+        mute_opts_frame.pack(pady=(3, 0))
+        self.spam_mute_var = tk.BooleanVar(value=self.config.get('spam_mute_enabled', True))
+        ttk.Checkbutton(mute_opts_frame, text="Auto-mute spam", variable=self.spam_mute_var,
+                        command=self.save_mute_settings).pack(side=tk.LEFT)
+        ttk.Label(mute_opts_frame, text="Mute for").pack(side=tk.LEFT, padx=(8, 2))
+        self.mute_minutes_var = tk.StringVar(value=str(self.config.get('mute_minutes', 10)))
+        mute_minutes_box = ttk.Spinbox(mute_opts_frame, from_=1, to=1440, width=5,
+                                       textvariable=self.mute_minutes_var, command=self.save_mute_settings)
+        mute_minutes_box.pack(side=tk.LEFT)
+        mute_minutes_box.bind('<FocusOut>', lambda e: self.save_mute_settings())
+        ttk.Label(mute_opts_frame, text="min").pack(side=tk.LEFT, padx=2)
+
         # USER VOICE PREFERENCES section
         user_voices_label = ttk.Label(right_frame, text="USER VOICES", font=('Arial', 10, 'bold'))
         user_voices_label.pack(pady=(10, 0))
@@ -968,14 +1458,7 @@ class TTSReplicaWASAPI:
         
         ttk.Button(longform_controls, text="Speak Long Text", command=self.speak_longform).pack(side=tk.LEFT, padx=5)
         ttk.Button(longform_controls, text="Clear", command=lambda: self.longform_text.delete("1.0", tk.END)).pack(side=tk.LEFT, padx=2)
-        
-        # TF2 output controls
-        self.tf2_output_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(longform_controls, text="Output to TF2 Chat (110 char chunks)", 
-                       variable=self.tf2_output_var).pack(side=tk.LEFT, padx=10)
-        
-        ttk.Label(longform_controls, text="Note: TF2 has 127 char limit. Text will be split into chunks.").pack(side=tk.LEFT, padx=5)
-        
+
         # Quick Speak/Apply controls - placed between longform and tabs
         quick_speak_frame = ttk.Frame(longform_paned)
         
@@ -1014,12 +1497,17 @@ class TTSReplicaWASAPI:
         settings_frame = ttk.Frame(tab)
         settings_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        # Game selection
+        # Game selection (games are added/edited/removed with the buttons next to it)
         ttk.Label(settings_frame, text="Game").grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
-        self.game_combo = ttk.Combobox(settings_frame, values=["Team Fortress 2", "Deep Rock Galactic"], width=50)
+        self.game_combo = ttk.Combobox(settings_frame, values=self.game_names(), width=50, state='readonly')
         self.game_combo.grid(row=0, column=1, padx=10, pady=5)
-        self.game_combo.set(self.config.get('current_game', 'Team Fortress 2'))
+        self.game_combo.set(self.current_game)
         self.game_combo.bind('<<ComboboxSelected>>', self.on_game_changed)
+        game_btn_frame = ttk.Frame(settings_frame)
+        game_btn_frame.grid(row=0, column=2, sticky=tk.W, padx=5, pady=5)
+        ttk.Button(game_btn_frame, text="+ Add Game", command=self.add_game).pack(side=tk.LEFT, padx=2)
+        ttk.Button(game_btn_frame, text="✎ Edit", command=self.edit_game).pack(side=tk.LEFT, padx=2)
+        ttk.Button(game_btn_frame, text="✖ Remove", command=self.remove_game).pack(side=tk.LEFT, padx=2)
         
         # TTS Command Prefix - moved from Voice Commands to Settings
         ttk.Label(settings_frame, text="TTS Command Prefix").grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
@@ -1076,7 +1564,8 @@ class TTSReplicaWASAPI:
         ttk.Button(config_frame, text="Export Config", command=self.export_config).pack(side=tk.LEFT, padx=5, pady=5)
         ttk.Button(config_frame, text="Import Config", command=self.import_config).pack(side=tk.LEFT, padx=5, pady=5)
         ttk.Button(config_frame, text="Reset to Defaults", command=self.reset_config).pack(side=tk.LEFT, padx=5, pady=5)
-        self.dectalk_volume_slider = ttk.Scale(dectalk_volume_frame, from_=0.0, to=1.0, 
+        # Up to 150%: DECtalk's own output peaks around 77% of full scale, so the very loudest bits may clip past ~130%
+        self.dectalk_volume_slider = ttk.Scale(dectalk_volume_frame, from_=0.0, to=1.5,
                                                variable=self.dectalk_volume_var, 
                                                orient=tk.HORIZONTAL, length=300)
         self.dectalk_volume_slider.pack(side=tk.LEFT)
@@ -1151,7 +1640,6 @@ class TTSReplicaWASAPI:
         btn_frame.pack(pady=10)
         
         ttk.Button(btn_frame, text="Select Device", command=self.select_audio_device).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Test Selected", command=self.test_selected_device).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Refresh Devices", command=self.refresh_audio_devices).pack(side=tk.LEFT, padx=5)
         
         # Current device label
@@ -1437,23 +1925,6 @@ Build: Full Featured"""
             else:
                 messagebox.showerror("Error", f"Failed to set device: {device_name}")
                 
-    def test_selected_device(self):
-        """Test the selected audio device"""
-        selection = self.device_tree.selection()
-        if selection:
-            item = self.device_tree.item(selection[0])
-            device_name = item['values'][0].replace(" [DEFAULT]", "")
-            
-            if self.audio_manager:
-                self.audio_manager.speak(f"Testing audio on {device_name}", device_override=device_name)
-        else:
-            messagebox.showwarning("No Selection", "Please select a device first")
-            
-    def test_audio_device(self):
-        """Test current audio device"""
-        if self.audio_manager:
-            self.audio_manager.test_current_device()
-            
     def refresh_audio_devices(self):
         """Refresh the list of audio devices"""
         if self.audio_manager:
@@ -1485,7 +1956,12 @@ Build: Full Featured"""
                 
     def load_settings(self):
         """Load all settings"""
-        self.log_path_var.set(self.config.get('log_path', ''))
+        # Log path, admins and blocked list belong to the current game (top-level keys are TF2's legacy copy)
+        game_config = self.get_current_game_config()
+        log_path = game_config.get('log_path', '')
+        if not log_path and self.current_game_key() == 'tf2':
+            log_path = self.config.get('log_path', '')  # TF2's legacy top-level copy, never another game's
+        self.log_path_var.set(log_path)
         self.admin_username_var.set(self.config.get('admin_username', 'Huskiefluffs'))
         self.private_mode_var.set(self.config.get('private_mode', False))
         
@@ -1493,8 +1969,10 @@ Build: Full Featured"""
         if hasattr(self, 'longform_voice_combo') and self.audio_manager:
             self.populate_longform_voice_combo()
         
-        # Set default voice from config
+        # Set default voice from config - the dropdown too, or the next Apply saves whatever it happens to show
         default_voice = self.config.get('default_voice', '')
+        if default_voice and hasattr(self, 'default_voice_combo'):
+            self.default_voice_combo.set(default_voice)
         if default_voice and self.audio_manager:
             # Apply the default voice to the audio manager
             for voice in self.voices:
@@ -1514,10 +1992,10 @@ Build: Full Featured"""
         self.admin_listbox.delete(0, tk.END)
         self.blocked_listbox.delete(0, tk.END)
         
-        for admin in self.config.get('admins', []):
+        for admin in game_config.get('admins', self.config.get('admins', [])):
             self.admin_listbox.insert(tk.END, admin)
-            
-        for blocked in self.config.get('blocked', []):
+
+        for blocked in game_config.get('blocked', self.config.get('blocked', [])):
             self.blocked_listbox.insert(tk.END, blocked)
             
         # Load user voice preferences
@@ -1552,14 +2030,16 @@ Build: Full Featured"""
         
         if msg['is_dead']:
             prefix += "*DEAD*"
+        if msg.get('is_spec'):
+            prefix += "*SPEC* "
         if msg['is_team']:
             prefix += "(TEAM) "
             
         display_text = f"{prefix}{msg['username']} : {msg['message']}\n"
         
         # Add to chat display
-        self.root.after(0, lambda: self.chat_display.insert(tk.END, display_text))
-        self.root.after(0, lambda: self.chat_display.see(tk.END))
+        self.run_on_gui(lambda: self.chat_display.insert(tk.END, display_text))
+        self.run_on_gui(lambda: self.chat_display.see(tk.END))
         
         # Don't track last_speaker here - only track when actually speaking
         
@@ -1568,7 +2048,12 @@ Build: Full Featured"""
         if msg['username'] in blocked_users:
             logger.info(f"Blocked user {msg['username']} tried to speak")
             return
-            
+
+        # Temporarily muted (!mute, spam guard, or the MUTED list) - shown above but not spoken
+        if self.is_muted(msg['username']):
+            logger.info(f"Muted user {msg['username']} tried to speak")
+            return
+
         # SECOND: Check auto-block keywords BEFORE any other processing
         if self.auto_block_var.get():
             keywords = self.config.get('auto_block_keywords', [])
@@ -1600,24 +2085,16 @@ Build: Full Featured"""
                             self.message_queue.put(temp_msg)
                     
                     # Update UI on main thread
-                    self.root.after(0, lambda u=msg['username']: self.update_ui_after_autoblock(u))
+                    self.run_on_gui(lambda u=msg['username']: self.update_ui_after_autoblock(u))
                     return
         
         # THIRD: Check for admin commands FIRST (before !tts processing)
         message = msg['message'].strip()
         admins = [self.admin_listbox.get(i) for i in range(self.admin_listbox.size())]
         
-        # Check for TTS stop command
-        current_tts_prefix = self.get_current_game_config().get('tts_command_prefix', '!tts')
-        tts_stop_command = f"{current_tts_prefix} stop"
-        if message.lower().strip() == tts_stop_command.lower():
-            if msg['username'] in admins:
-                self.force_stop_tts()
-                return
-            else:
-                logger.info(f"Non-admin {msg['username']} tried to stop TTS")
-                return
-                
+        # NOTE: "!tts stop" is intentionally NOT a command. It falls through to
+        # normal TTS so the word "stop" can actually be spoken. Use !stop to stop.
+
         # Check for !stop command (stops all current speech)
         if message.lower().strip() == '!stop':
             if msg['username'] in admins:
@@ -1639,10 +2116,13 @@ Build: Full Featured"""
             logger.info(f"Is {msg['username']} in admins? {msg['username'] in admins}")
             if msg['username'] in admins:
                 logger.info(f"Admin confirmed. Last speaker: {self.last_speaker}, Currently speaking: {self.currently_speaking_user}")
-                # Determine who to block - prioritize currently speaking user, then last speaker
-                user_to_block = self.currently_speaking_user if self.currently_speaking_user else self.last_speaker
-                
-                if user_to_block and user_to_block != msg['username']:
+                # Determine who to block - prioritize currently speaking user, then last speaker. Never an
+                # internal speaker: during an announcement or long-form text that would silence those for good.
+                user_to_block = self.currently_speaking_user
+                if not user_to_block or user_to_block.startswith(('__', '[')):
+                    user_to_block = self.last_speaker
+
+                if user_to_block and user_to_block != msg['username'] and not user_to_block.startswith(('__', '[')):
                     logger.info(f"Admin block command: blocking {user_to_block}")
                     # Clear the blocked user's messages from queue and add to blocked list
                     self.clear_user_from_queue(user_to_block, add_to_blocked=True)
@@ -1734,8 +2214,60 @@ Build: Full Featured"""
                 else:
                     logger.info("Block list is already empty")
                 return
-        
-        # FOURTH: Check for TTS commands - these should NOT be spoken  
+
+        # !mute [minutes]: mute whoever is talking (or last used TTS) for a while - default length from the
+        # MUTED section. !unmute: lift the most recent mute.
+        mute_match = re.match(r'^!mute(?:\s+(\d+))?$', message.lower().strip())
+        if mute_match:
+            if msg['username'] in admins:
+                # Whoever is talking - unless that's an announcement/long-form, then the last TTS user
+                user_to_mute = self.currently_speaking_user
+                if not user_to_mute or user_to_mute.startswith(('__', '[')):
+                    user_to_mute = getattr(self, 'last_speaker', None)
+                if user_to_mute and user_to_mute != msg['username'] and not user_to_mute.startswith(('__', '[')):
+                    minutes = int(mute_match.group(1)) if mute_match.group(1) else None
+                    self.mute_user(user_to_mute, minutes)
+                else:
+                    logger.info("No valid user to mute")
+            else:
+                logger.info(f"Non-admin {msg['username']} tried to use !mute")
+            return
+
+        if message.lower().strip() == '!unmute':
+            if msg['username'] in admins:
+                with self._mute_lock:
+                    latest = next(reversed(self.muted_users), None) if self.muted_users else None
+                if latest:
+                    self.unmute_user(latest)
+                else:
+                    logger.info("Nobody is muted")
+            return
+
+        # DJ: "!sr <YouTube link or song name>" requests a song (when requests are on in the DJ window);
+        # admins can "!skipsong". Blocked and muted players never get here.
+        lowered = message.lower()
+        if self.dj and (lowered == '!sr' or lowered.startswith('!sr ')):
+            is_admin = msg['username'] in admins
+            if self.private_mode_var.get() and not is_admin:
+                return
+            def reply(text):
+                self.run_on_gui(lambda: (self.chat_display.insert(tk.END, f"[DJ] {text}\n"),
+                                         self.chat_display.see(tk.END)))
+            if not self.dj.request(msg['username'], message[3:], is_admin, reply):
+                logger.info(f"Song request from {msg['username']} ignored (requests are off for them)")
+            return
+        if self.dj and lowered == '!skipsong':
+            if msg['username'] in admins:
+                self.dj.skip()
+            return
+
+        # Soundboard: "yee" / "yee 150" (open mode) or "!s yee" (command mode) plays right away - no queue.
+        # Cooldowns and who-can-use are handled inside; a trigger is never spoken as TTS.
+        if self.soundboard and self.soundboard.handle_chat(msg['username'], message, msg['username'] in admins,
+                                                           self.private_mode_var.get()):
+            return
+
+        # FOURTH: Check for TTS commands - these should NOT be spoken
         current_tts_prefix = self.get_current_game_config().get('tts_command_prefix', '!tts')
         tts_command_trigger = f"{current_tts_prefix} "
         
@@ -1754,7 +2286,13 @@ Build: Full Featured"""
                 if msg['username'] not in admins:
                     logger.info(f"Non-admin {msg['username']} tried to use TTS in private mode")
                     return
-                    
+
+            # Spam guard: the same message over and over, or a burst of pastes -> temporary mute
+            if msg['username'] not in admins and self.check_spam(msg['username'], text_to_speak):
+                logger.info(f"Spam guard: muting {msg['username']}")
+                self.mute_user(msg['username'], announcement='SPAM MUTED')
+                return
+
             # Check for voice commands in the !tts text
             # Check for any slash command (including /vt, /v, etc.)
             if text_to_speak.startswith('/'):
@@ -1799,8 +2337,8 @@ Build: Full Featured"""
                 return
                 
         # Check for voice commands - support flexible patterns
-        import re
-        
+        # (uses the module-level re; a local "import re" here would break the earlier re.match for !mute)
+
         # Check for /v [number] format specifically (most common)
         if re.match(r'^/v\s+\d+', message):
             self.process_voice_command(message, username=msg['username'])
@@ -2100,52 +2638,19 @@ Build: Full Featured"""
         logger.info(f"Populated long-form voice combo with {len(voice_list)} voices")
     
     def speak_longform(self):
-        """Handle long-form text input with optional TF2 chat output"""
+        """Speak the long-form text box with the chosen voice.
+        (The old "Output to TF2 Chat" option was removed: it appended say lines to log.txt, which TF2 only
+        writes and never reads, so nothing ever reached the game.)"""
         text = self.longform_text.get("1.0", tk.END).strip()
         if not text:
             logger.warning("No text entered in long-form input")
             return
-        
+
         # Get selected voice
         selected_voice = self.longform_voice_var.get()
         if selected_voice == "Default":
             selected_voice = None
-        
-        # Check if TF2 output is enabled
-        output_to_tf2 = self.tf2_output_var.get()
-        
-        if output_to_tf2 and self.log_path_var.get():
-            # Split text into 110 character chunks for TF2 chat
-            chunks = []
-            current_chunk = ""
-            words = text.split()
-            
-            for word in words:
-                # Check if adding this word would exceed the limit
-                test_chunk = current_chunk + " " + word if current_chunk else word
-                if len(test_chunk) <= 110:
-                    current_chunk = test_chunk
-                else:
-                    # Save current chunk and start new one
-                    if current_chunk:
-                        chunks.append(current_chunk)
-                    current_chunk = word
-            
-            # Add any remaining text
-            if current_chunk:
-                chunks.append(current_chunk)
-            
-            # Output each chunk to TF2 chat
-            import time
-            for i, chunk in enumerate(chunks):
-                tf2_command = f'say "{chunk}"'
-                with open(self.log_path_var.get(), 'a', encoding='utf-8') as f:
-                    f.write(tf2_command + '\n')
-                logger.info(f"TF2 chat output ({i+1}/{len(chunks)}): {chunk}")
-                # Small delay between chunks to avoid flooding
-                if i < len(chunks) - 1:
-                    time.sleep(0.1)
-        
+
         # Speak the full text with selected voice
         logger.info(f"Speaking long-form text ({len(text)} chars) with voice: {selected_voice}")
         self.speak(text, voice_name=selected_voice, username="[Long-form Input]")
@@ -2158,7 +2663,9 @@ Build: Full Featured"""
         """Process messages from the queue sequentially"""
         import time
         
-        while self.queue_running:
+        # A restart (Reload, Edit Game, Stop+Start) can begin a new speech thread while this one is still in a
+        # long DECtalk message; when it finishes it must exit rather than keep speaking alongside the new one
+        while self.queue_running and self.queue_thread is threading.current_thread():
             try:
                 # Wait for a message (timeout to check running status)
                 msg = self.message_queue.get(timeout=0.5)
@@ -2168,7 +2675,10 @@ Build: Full Featured"""
                 if msg.get('username') in blocked_users:
                     logger.info(f"Skipping message from blocked user: {msg.get('username')}")
                     continue
-                
+                if msg.get('username') and self.is_muted(msg.get('username')):
+                    logger.info(f"Skipping message from muted user: {msg.get('username')}")
+                    continue
+
                 # Track who is currently speaking
                 self.currently_speaking_user = msg.get('username')
                 
@@ -2210,7 +2720,19 @@ Build: Full Featured"""
                             if user_voice.startswith("[DECtalk] "):
                                 current_voice = user_voice
                                 logger.info(f"Using {username}'s DECtalk preference: {current_voice}")
-                    
+                        elif str(self.config.get('default_voice', '')).startswith("[DECtalk] "):
+                            # No voice of their own and the Default Voice is DECtalk (apply_default_voice only
+                            # knows Windows voices, so without this they'd get whichever Windows voice was last)
+                            current_voice = self.config['default_voice']
+
+                    # DECtalk commands sent with a non-DECtalk voice: use DECtalk for this one message only
+                    # (their saved voice is untouched) so SAPI doesn't read "[:phoneme on]..." as gibberish
+                    if not (current_voice and current_voice.startswith("[DECtalk] ")) and DECTALK_MARKUP.search(text_to_speak):
+                        auto_voice = self.get_dectalk_auto_voice(msg.get('username'))
+                        if auto_voice:
+                            logger.info(f"DECtalk markup from {msg.get('username')} on a non-DECtalk voice ({current_voice}) - using {auto_voice} for this message")
+                            current_voice = auto_voice
+
                     # Check if using DECtalk
                     used_special_voice = False
                     if current_voice and current_voice.startswith("[DECtalk] "):
@@ -2238,7 +2760,7 @@ Build: Full Featured"""
                             
                             # Speak with native DECtalk directly with volume control
                             logger.info(f"Text being sent to DECtalk: '{text_to_speak}'")
-                            dectalk_volume = self.dectalk_volume_var.get() if hasattr(self, 'dectalk_volume_var') else 0.7
+                            dectalk_volume = self.dectalk_volume
                             success = self.dectalk_native.speak(text_to_speak, profile_name, use_wav=True, device_override=current_device, volume=dectalk_volume)
                             if success:
                                 used_special_voice = True
@@ -2270,7 +2792,10 @@ Build: Full Featured"""
                         self.audio_manager.speak(text_to_speak, use_sync=False)
                     
                     # Wait for speech to complete or be interrupted (only for SAPI5)
-                    if not used_special_voice:
+                    # Windows voices normally don't hold up the queue, so DECtalk and Windows voices can talk over
+                    # each other (the way it has always behaved). is_speaking() used to be broken and always
+                    # said False; now that it works, waiting is opt-in: config "sapi_wait_for_turn": true.
+                    if not used_special_voice and self.config.get('sapi_wait_for_turn', False):
                         max_wait = 60  # Maximum 60 seconds per message
                         wait_time = 0
                         
@@ -2308,6 +2833,26 @@ Build: Full Featured"""
             except Exception as e:
                 logger.error(f"Error processing speech queue: {e}")
             
+    def get_dectalk_auto_voice(self, username=None):
+        """DECtalk voice for one-off messages containing DECtalk markup, or None if switched off/unavailable.
+        Uses the user's own saved DECtalk voice if they have one (e.g. they picked a SAPI voice with /v for
+        this message), otherwise config "dectalk_auto_voice" (profile name, default Perfect Paul).
+        Config "dectalk_auto_switch": false turns this off."""
+        if not self.config.get('dectalk_auto_switch', True) or not self.dectalk_enabled:
+            return None
+        if not (self.dectalk_native and self.dectalk_native.is_available()):
+            return None
+        saved = self.user_voice_preferences.get(username, '') if username else ''
+        if saved.startswith("[DECtalk] "):
+            return saved
+        profiles = self.dectalk_profiles or {}
+        wanted = self.config.get('dectalk_auto_voice', 'Perfect Paul').replace("[DECtalk] ", "")
+        if wanted in profiles:
+            return f"[DECtalk] {wanted}"
+        if profiles:
+            return f"[DECtalk] {next(iter(profiles))}"
+        return None
+
     def speak_with_voice(self, text, voice_name, username=None):
         """Queue text with a specific voice"""
         if not self.audio_manager:
@@ -2362,7 +2907,139 @@ Build: Full Featured"""
             
         if removed_count > 0:
             logger.info(f"Removed {removed_count} queued messages from {username}")
-            
+
+    def queue_announcement_next(self, announcement_type, username=None):
+        """Put an announcement at the front of the speech queue, like the block announcements"""
+        announcement_text = self.get_announcement_text(announcement_type, username=username)
+        if not announcement_text:
+            return
+        waiting = []
+        while not self.message_queue.empty():
+            try:
+                waiting.append(self.message_queue.get_nowait())
+            except queue.Empty:
+                break
+        announcement_voice = self.config.get('announcement_voice', '')
+        self.message_queue.put({'text': announcement_text, 'voice': announcement_voice, 'username': '__announcement__'})
+        for item in waiting:
+            self.message_queue.put(item)
+
+    def is_muted(self, username):
+        """True while a temporary mute is running (a mute that has run out is dropped)"""
+        with self._mute_lock:
+            until = self.muted_users.get(username)
+            if until is None:
+                return False
+            if until > time.time():
+                return True
+            del self.muted_users[username]
+            self.config['muted_users'] = dict(self.muted_users)
+        self.save_config()
+        return False
+
+    def mute_user(self, username, minutes=None, announcement='MUTED'):
+        """Mute a player for a while: drop their queued messages, cut them off if they're talking, announce it.
+        announcement is 'MUTED' (admin/manual) or 'SPAM MUTED' (spam guard)."""
+        if not username or username.startswith('__'):
+            return
+        if minutes is None:
+            minutes = self.config.get('mute_minutes', 10)
+        with self._mute_lock:
+            self.muted_users.pop(username, None)  # re-insert so the newest mute is last (for !unmute)
+            self.muted_users[username] = time.time() + minutes * 60
+            self.spam_history.pop(username, None)
+            self.config['muted_users'] = dict(self.muted_users)
+        self.save_config()
+        self.clear_user_from_queue(username, add_to_blocked=False)
+        logger.info(f"Muted {username} for {minutes} min ({announcement})")
+        if self.is_running:  # otherwise it would sit in the queue and play whenever TTS is next started
+            self.queue_announcement_next(announcement, username=username)
+        reason = " (spam)" if announcement == 'SPAM MUTED' else ""
+        self.run_on_gui(lambda: (self.chat_display.insert(tk.END, f"[SYSTEM] Muted {username} for {minutes} min{reason}\n"),
+                                 self.chat_display.see(tk.END)))
+        self.run_on_gui(self.refresh_muted_list)
+
+    def unmute_user(self, username):
+        """Lift a mute early. Returns True if they were muted."""
+        with self._mute_lock:
+            removed = self.muted_users.pop(username, None) is not None
+            self.config['muted_users'] = dict(self.muted_users)
+        if removed:
+            self.save_config()
+            logger.info(f"Unmuted {username}")
+            self.run_on_gui(self.refresh_muted_list)
+        return removed
+
+    def check_spam(self, username, text):
+        """Record a TTS message and return True if the player is spamming: the same message (loosely
+        matched) spam_repeat_count times within spam_repeat_window seconds, or spam_flood_count messages
+        of any kind within spam_flood_window seconds. Defaults: 3 in 30s, 5 in 10s."""
+        if not self.config.get('spam_mute_enabled', True):
+            return False
+        repeat_count = self.config.get('spam_repeat_count', 3)
+        repeat_window = self.config.get('spam_repeat_window', 30)
+        flood_count = self.config.get('spam_flood_count', 5)
+        flood_window = self.config.get('spam_flood_window', 10)
+        now = time.time()
+        signature = spam_signature(text)
+        with self._mute_lock:
+            keep = max(repeat_window, flood_window)
+            history = [(t, s) for t, s in self.spam_history.get(username, []) if now - t <= keep]
+            history.append((now, signature))
+            self.spam_history[username] = history
+            repeats = sum(1 for t, s in history if s == signature and now - t <= repeat_window)
+            burst = sum(1 for t, s in history if now - t <= flood_window)
+        return repeats >= repeat_count or burst >= flood_count
+
+    def refresh_muted_list(self):
+        """Redraw the MUTED list with minutes left (GUI thread only)"""
+        if not hasattr(self, 'muted_listbox'):
+            return
+        now = time.time()
+        with self._mute_lock:
+            active = [(u, t) for u, t in self.muted_users.items() if t > now]
+        self.muted_listbox.delete(0, tk.END)
+        self.muted_listbox_names = []
+        for username, until in active:
+            minutes_left = max(1, int((until - now + 59) // 60))
+            self.muted_listbox.insert(tk.END, f"{username} ({minutes_left} min left)")
+            self.muted_listbox_names.append(username)
+
+    def tick_mutes(self):
+        """Every 30s: let expired mutes go and update the minutes shown"""
+        for username in list(self.muted_users):
+            self.is_muted(username)  # drops it if it has run out
+        self.refresh_muted_list()
+        self.root.after(30000, self.tick_mutes)
+
+    def unmute_selected(self):
+        """✖ Unmute button"""
+        sel = self.muted_listbox.curselection()
+        if sel and sel[0] < len(self.muted_listbox_names):
+            self.unmute_user(self.muted_listbox_names[sel[0]])
+
+    def add_mute(self):
+        """+ Mute button: mute a player by name"""
+        from tkinter import simpledialog
+        name = simpledialog.askstring("Mute User", "Enter username:")
+        if not name:
+            return
+        minutes = simpledialog.askinteger("Mute User", "Mute for how many minutes?",
+                                          initialvalue=self.config.get('mute_minutes', 10), minvalue=1, maxvalue=1440)
+        if minutes:
+            self.mute_user(name, minutes)
+
+    def save_mute_settings(self):
+        """Auto-mute spam checkbox and the default mute length"""
+        self.config['spam_mute_enabled'] = self.spam_mute_var.get()
+        try:
+            minutes = int(self.mute_minutes_var.get())
+            if minutes >= 1:
+                self.config['mute_minutes'] = minutes
+        except ValueError:
+            self.mute_minutes_var.set(str(self.config.get('mute_minutes', 10)))
+        self.save_config()
+
     def get_announcement_text(self, announcement_type, text="", username=None):
         """Get announcement text with username if provided"""
         # Check if this specific announcement is enabled
@@ -2383,7 +3060,7 @@ Build: Full Featured"""
         
         # Use provided text or get from config
         if not text:
-            text = announcements.get(announcement_type, "")
+            text = announcements.get(announcement_type, DEFAULT_ANNOUNCEMENTS.get(announcement_type, ""))
         
         if not text:
             return None
@@ -2439,8 +3116,9 @@ Build: Full Featured"""
                         else:
                             logger.debug(f"Speak test - Already using voice: {default_voice}")
                         break
-            self.speak(text)
-            
+            # A DECtalk default voice isn't a Windows voice, so it has to ride along with the message
+            self.speak(text, voice_name=default_voice if default_voice.startswith("[DECtalk] ") else None)
+
     
     def update_ui_after_autoblock(self, username):
         """Update UI after auto-blocking a user (called on main thread)"""
@@ -2450,12 +3128,20 @@ Build: Full Featured"""
         logger.info(f"UI updated for auto-blocked user: {username}")
             
     def force_stop_tts(self):
-        """Force stop all TTS"""
-        if self.audio_manager:
-            self.audio_manager.stop()
+        """Force stop all TTS.
+
+        Delegates to stop_all_speech() so "!tts stop" behaves identically to
+        "!stop": it skips the current utterance, stops the native DECtalk
+        engine, AND clears the pending message queue. Previously this only
+        called audio_manager.stop(), leaving the queue and DECtalk in an
+        inconsistent state.
+        """
+        self.stop_all_speech()
             
     def stop_all_speech(self):
-        """Stop all current speech immediately"""
+        """Stop all current speech immediately (and any soundboard sounds)"""
+        if getattr(self, 'soundboard', None):
+            self.soundboard.stop_all()
         if self.audio_manager:
             try:
                 self.audio_manager.stop_all_speech()
@@ -2483,16 +3169,17 @@ Build: Full Featured"""
             messagebox.showerror("Error", "Please set log file path")
             return
         
-        game_key = 'tf2' if self.current_game == 'Team Fortress 2' else 'drg'
+        game_key = self.current_game_key()
         
         # Stop existing monitor for this game if any
         if game_key in self.monitors:
             self.monitors[game_key].stop()
         
-        # Create appropriate monitor
-        if game_key == 'tf2':
+        # Create appropriate monitor: any Source game's console log reads like TF2's
+        game_type = self.game_configs.get(game_key, {}).get('type', 'source')
+        if game_type == 'source':
             self.monitors[game_key] = TF2LogMonitor(log_path)
-        elif game_key == 'drg' and DRG_MONITOR_AVAILABLE:
+        elif game_type == 'drg' and DRG_MONITOR_AVAILABLE:
             self.monitors[game_key] = DRGLogMonitor(log_path)
         else:
             messagebox.showerror("Error", f"Monitor not available for {self.current_game}")
@@ -2551,6 +3238,7 @@ Build: Full Featured"""
         
         # Reload config
         self.config = self.load_config()
+        self.apply_config()
         self.load_settings()
         
         if was_running:
@@ -2572,7 +3260,7 @@ Build: Full Featured"""
     def save_admins(self):
         """Save admin list for current game"""
         admins = [self.admin_listbox.get(i) for i in range(self.admin_listbox.size())]
-        game_key = 'tf2' if self.current_game == 'Team Fortress 2' else 'drg'
+        game_key = self.current_game_key()
         
         # Save to game-specific config
         if 'games' not in self.config:
@@ -2603,7 +3291,7 @@ Build: Full Featured"""
     def save_blocked(self):
         """Save blocked list for current game"""
         blocked = [self.blocked_listbox.get(i) for i in range(self.blocked_listbox.size())]
-        game_key = 'tf2' if self.current_game == 'Team Fortress 2' else 'drg'
+        game_key = self.current_game_key()
         
         # Save to game-specific config
         if 'games' not in self.config:
@@ -2737,10 +3425,31 @@ Build: Full Featured"""
         """Update DECtalk volume label and save to config"""
         volume = self.dectalk_volume_var.get()
         self.dectalk_volume_label.config(text=f"{int(volume * 100)}%")
-        # Save to config
+        # Save to config once the slider stops moving, not on every tick
+        self.dectalk_volume = volume
         self.config['dectalk_volume'] = volume
-        self.save_config()
+        if getattr(self, '_volume_save_job', None):
+            self.root.after_cancel(self._volume_save_job)
+        self._volume_save_job = self.root.after(500, self.save_config)
     
+    def refresh_voice_commands_display(self):
+        """After DECtalk profiles change: refresh the voice pickers and the Voice Commands list.
+        (The profile Add/Update/Remove/Reset/Import buttons called this, but it was never written, so they
+        stopped with an error before their success message.)"""
+        self.refresh_voice_combos()
+        if hasattr(self, 'voice_tree'):
+            for item in self.voice_tree.get_children():
+                self.voice_tree.delete(item)
+            for cmd, voice in self.voice_commands.items():
+                self.voice_tree.insert('', tk.END, values=(cmd, voice), tags=(cmd,))
+
+    def update_user_voices_list(self):
+        """Redraw the USER VOICES list from user_voice_preferences (was called but missing)"""
+        if hasattr(self, 'user_voices_listbox'):
+            self.user_voices_listbox.delete(0, tk.END)
+            for username, voice in self.user_voice_preferences.items():
+                self.user_voices_listbox.insert(tk.END, f"{username}: {voice}")
+
     def refresh_voice_combos(self):
         """Refresh voice combo boxes to exclude hidden voices and add special voices"""
         voice_names = []
@@ -2796,6 +3505,11 @@ Build: Full Featured"""
     
     def refresh_dectalk_profiles(self):
         """Refresh the DECtalk profiles listbox"""
+        # Keep the native DECtalk engine's profile table in sync with the
+        # user-edited profiles. Without this, the engine uses its own
+        # hardcoded table and ignores any profiles added/edited in the GUI.
+        if getattr(self, 'dectalk_native', None) is not None:
+            self.dectalk_native.voice_profiles = self.dectalk_profiles
         self.dectalk_profiles_listbox.delete(0, tk.END)
         for name in sorted(self.dectalk_profiles.keys()):
             self.dectalk_profiles_listbox.insert(tk.END, name)
@@ -2880,8 +3594,10 @@ Build: Full Featured"""
         test_text = f"Testing {name} voice profile."
         
         if self.dectalk_native and self.dectalk_native.is_available():
-            # Test with native DECtalk
-            success = self.dectalk_native.speak(test_text, name)
+            # Test with native DECtalk - same volume slider and output device as real chat messages
+            success = self.dectalk_native.speak(test_text, name, use_wav=True,
+                                                device_override=self.config.get('audio_device', 'Default'),
+                                                volume=self.dectalk_volume)
             if success:
                 logger.info(f"Tested DECtalk profile: {name} with native DECtalk")
             else:
@@ -3269,15 +3985,15 @@ Build: Full Featured"""
                 voice_listbox.insert(tk.END, dectalk_label)
         
         
-        # Select current voice
-        try:
-            idx = voice_names.index(old_voice)
-            voice_listbox.selection_set(idx)
-            voice_listbox.see(idx)
-        except ValueError:
-            if voice_names:
-                voice_listbox.selection_set(0)
-        
+        # Select current voice - by listbox row (the list has divider rows that voice_names doesn't, so an
+        # index into voice_names would land two rows off for DECtalk voices)
+        rows = list(voice_listbox.get(0, tk.END))
+        if old_voice in rows:
+            voice_listbox.selection_set(rows.index(old_voice))
+            voice_listbox.see(rows.index(old_voice))
+        elif voice_names:
+            voice_listbox.selection_set(0)
+
         # Buttons
         button_frame = ttk.Frame(dialog)
         button_frame.pack(pady=10)
@@ -3381,17 +4097,19 @@ Build: Full Featured"""
                     voice_names.append(dectalk_label)
                     voice_listbox.insert(tk.END, dectalk_label)
                 
-            # Select current voice
-            try:
-                idx = voice_names.index(current_voice)
-                voice_listbox.selection_set(idx)
-            except ValueError:
-                pass
-                
+            # Select current voice - by listbox row (the divider rows mean voice_names indexes don't line up)
+            rows = list(voice_listbox.get(0, tk.END))
+            if current_voice in rows:
+                voice_listbox.selection_set(rows.index(current_voice))
+                voice_listbox.see(rows.index(current_voice))
+
             def apply_voice():
                 sel = voice_listbox.curselection()
                 if sel:
-                    new_voice = voice_names[sel[0]]
+                    # Read the row's text: indexing voice_names picked the voice two rows further down
+                    new_voice = voice_listbox.get(sel[0])
+                    if not new_voice or new_voice.startswith('---'):
+                        return  # a divider row, not a voice
                     # Update the tree
                     self.voice_tree.item(selection[0], values=(cmd, new_voice))
                     # Update the mapping
@@ -3474,13 +4192,18 @@ Build: Full Featured"""
         if self.voices:
             voice_names = [v.name for v in self.voices]
             self.announcement_voice_combo['values'] = voice_names
-            # Set to Microsoft Sam or first voice
-            for v in voice_names:
-                if 'Sam' in v:
-                    self.announcement_voice_combo.set(v)
-                    break
+            # The saved choice, else Microsoft Sam, else the first voice (showing anything else here would get
+            # saved over your choice by the next Save Announcements)
+            saved_voice = self.config.get('announcement_voice', '')
+            if saved_voice:
+                self.announcement_voice_combo.set(saved_voice)
             else:
-                self.announcement_voice_combo.set(voice_names[0])
+                for v in voice_names:
+                    if 'Sam' in v:
+                        self.announcement_voice_combo.set(v)
+                        break
+                else:
+                    self.announcement_voice_combo.set(voice_names[0])
                 
         # Announcements grid
         announcements_frame = ttk.LabelFrame(container, text="Announcement Messages")
@@ -3492,12 +4215,15 @@ Build: Full Featured"""
             ("BLOCK ADD", "blocked, you abused it so you losed it"),
             ("BLOCK REMOVE", "has been unblocked"),
             ("AUTOBLOCK TRIGGERED", "blocked, you can't say that"),
-            ("TTS STOPPED", "TTS stopped by admin")
+            ("TTS STOPPED", "TTS stopped by admin"),
+            ("MUTED", DEFAULT_ANNOUNCEMENTS['MUTED']),
+            ("SPAM MUTED", DEFAULT_ANNOUNCEMENTS['SPAM MUTED'])
         ]
         
         self.announcement_vars = {}
         self.announcement_enabled_vars = {}
-        
+        self.announcement_defaults = {}  # for apply_config to refill the fields after Import/Reset/Reload
+
         # Headers
         ttk.Label(announcements_frame, text="On", font=('Arial', 9, 'bold')).grid(row=0, column=0, padx=5, pady=3)
         ttk.Label(announcements_frame, text="Type", font=('Arial', 9, 'bold')).grid(row=0, column=1, sticky=tk.W, padx=10, pady=3)
@@ -3522,6 +4248,7 @@ Build: Full Featured"""
             var = tk.StringVar(value=saved_value)
             ttk.Entry(announcements_frame, textvariable=var, width=40).grid(row=row, column=2, padx=10, pady=2)
             self.announcement_vars[key] = var
+            self.announcement_defaults[key] = default
             
             # Test button for each announcement
             ttk.Button(announcements_frame, text="Test", width=6,
@@ -3811,7 +4538,7 @@ Build: Full Featured"""
         
     def apply_settings(self):
         """Apply all settings"""
-        game_key = 'tf2' if self.current_game == 'Team Fortress 2' else 'drg'
+        game_key = self.current_game_key()
         
         # Save game-specific settings
         if 'games' not in self.config:
@@ -3820,11 +4547,18 @@ Build: Full Featured"""
             self.config['games'][game_key] = {}
         
         self.config['games'][game_key]['log_path'] = self.log_path_var.get()
-        
+
+        # TTS command prefix (per game) - Apply saves everything on this tab
+        if hasattr(self, 'tts_prefix_entry'):
+            tts_prefix = self.tts_prefix_entry.get().strip()
+            if tts_prefix:
+                self.config['games'][game_key]['tts_command_prefix'] = tts_prefix
+
         # Save global settings
         self.config['admin_username'] = self.admin_username_var.get()
         self.config['private_mode'] = self.private_mode_var.get()
         self.config['auto_block'] = self.auto_block_var.get()
+        self.config['auto_block_enabled'] = self.auto_block_var.get()  # what load_settings reads first
         self.config['default_voice'] = self.default_voice_combo.get()
         self.config['current_game'] = self.current_game
         
@@ -3858,6 +4592,10 @@ Build: Full Featured"""
         """Handle window closing"""
         if self.is_running:
             self.stop_tts()
+        if getattr(self, 'dj', None):
+            self.dj.shutdown()  # stops the music and saves the queue
+        if getattr(self, 'soundboard', None):
+            self.soundboard.shutdown()
         if self.audio_manager:
             self.audio_manager.stop()
         self.save_config()

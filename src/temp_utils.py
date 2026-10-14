@@ -65,18 +65,60 @@ def get_temp_file(suffix='', prefix='tts_'):
     logger.debug(f"Created temp file: {path}")
     return path
 
+def release_temp_file(path):
+    """Delete a temp file as soon as it's finished with. Retries briefly (a just-killed say.exe or a closing
+    player can hold it for a moment); if it still can't go, it stays tracked for the exit cleanup."""
+    import time
+    for attempt in range(5):
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+            _temp_files.discard(path)
+            return True
+        except OSError:
+            time.sleep(0.1)
+    logger.warning(f"Could not delete temp file yet (will retry at exit): {path}")
+    return False
+
+def cleanup_orphaned_bundle_dirs():
+    """
+    The packaged exe unpacks itself into %TEMP%\\_MEIxxxxxx each run and deletes it on a clean exit, but a
+    crash, a force-close or shutting the PC down with the TTS open leaves the folder behind. Remove the ones
+    left by earlier runs of THIS app (they contain dectalk\\vs6). A folder still in use by another running copy
+    can't be renamed, so it's skipped - nothing in use gets half-deleted.
+    """
+    if not (getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS')):
+        return 0
+    current = Path(sys._MEIPASS).resolve()
+    removed = 0
+    for folder in current.parent.glob('_MEI*'):
+        try:
+            if not folder.is_dir() or folder.resolve() == current:
+                continue
+            if not (folder / 'dectalk' / 'vs6').is_dir():
+                continue  # another program's folder
+            doomed = folder.with_name(folder.name + '_old')
+            os.rename(folder, doomed)  # fails while a running copy has files open in it
+        except OSError:
+            continue
+        shutil.rmtree(doomed, ignore_errors=True)
+        removed += 1
+    if removed:
+        logger.info(f"Removed {removed} leftover temp folder(s) from earlier runs")
+    return removed
+
 def cleanup_old_temp_files(max_age_hours=24):
     """
     Clean up old temporary files from the temp directory.
     """
     import time
-    
+
     temp_dir = get_temp_dir()
     current_time = time.time()
     max_age_seconds = max_age_hours * 3600
-    
+
     try:
-        for file_path in temp_dir.glob("tts_*"):
+        for file_path in list(temp_dir.glob("tts_*")) + list(temp_dir.glob("dectalk_*")):
             if file_path.is_file():
                 file_age = current_time - file_path.stat().st_mtime
                 if file_age > max_age_seconds:
