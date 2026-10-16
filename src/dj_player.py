@@ -11,15 +11,21 @@ engine's state on a timer (every 250 ms), so no Tk calls ever come from a backgr
 """
 
 import array
+import hashlib
+import json
 import logging
 import os
 import random
 import re
+import secrets
 import shutil
+import ssl
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from collections import deque
@@ -27,6 +33,10 @@ from pathlib import Path
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+try:
+    import ui_theme  # sizes that follow Windows scaling, theme hint colour
+except Exception:
+    ui_theme = None
 
 try:
     import numpy as np
@@ -85,10 +95,16 @@ DEFAULTS = {
     'announce_voice': 'Default',  # 'Default' = the announcement voice from the Announcements tab
     'requests': 'off',            # chat !sr: 'off' | 'admins' | 'everyone'
     'request_max_minutes': 8,     # 0 = no limit (admins are never limited)
-    'request_limit': 1,           # songs one non-admin may have waiting in the queue
+    'request_limit': 1,           # songs one non-admin may have waiting (queue + awaiting approval); 0 = no limit
+    'autoplay': True,             # start playing when something is added to an empty, stopped queue
     'shuffle': False,
     'repeat': 'off',              # 'off' | 'all' | 'one'
     'output_device': '',          # '' = same device as the TTS
+    'bass_db': 0,                 # bass boost/cut in dB (TF2's voice codec is boomy; around -6 helps)
+    'request_source': 'youtube',  # what !sr words search: 'youtube' | 'library' | 'library_first'
+    'request_approval': False,    # requests wait in the Requests tab until the DJ approves them
+    'approval_admins_skip': True, # ...except admins' requests
+    'scrobble': False,            # tell the Subsonic server what was played (play counts)
 }
 
 
@@ -113,6 +129,84 @@ def clean_title(title):
 def make_track(title, source, target, duration=None, requested_by=None):
     return {'title': title, 'source': source, 'target': target,
             'duration': duration, 'requested_by': requested_by}
+
+
+class SubsonicClient:
+    """Minimal Subsonic API client - Navidrome, Airsonic, Gonic etc. all speak it.
+    Uses token sign-in, so the password itself is never stored: only md5(password + salt) and the salt.
+    Library tracks are saved in the queue as their song id ('subsonic' source); the stream link (which
+    carries the token) is only built at play time and never logged."""
+    API_VERSION = '1.16.1'
+
+    def __init__(self, url, user, token, salt, insecure=False):
+        self.url = self.normalize_url(url)
+        self.user = user
+        self.token = token
+        self.salt = salt
+        self.insecure = insecure  # accept a self-signed HTTPS certificate
+
+    @staticmethod
+    def normalize_url(url):
+        url = (url or '').strip().rstrip('/')
+        if url.lower().endswith('/rest'):
+            url = url[:-5]
+        if url and not re.match(r'^https?://', url, re.I):
+            url = 'http://' + url
+        return url
+
+    @staticmethod
+    def make_token(password):
+        salt = secrets.token_hex(8)
+        return hashlib.md5((password + salt).encode('utf-8')).hexdigest(), salt
+
+    def url_for(self, method, **extra):
+        params = {'u': self.user, 't': self.token, 's': self.salt, 'v': self.API_VERSION, 'c': 'TF2Speech', 'f': 'json'}
+        params.update({k: v for k, v in extra.items() if v is not None})
+        return f"{self.url}/rest/{method}.view?" + urllib.parse.urlencode(params)
+
+    def call(self, method, timeout=15, **extra):
+        context = ssl._create_unverified_context() if self.insecure else None
+        try:
+            with urllib.request.urlopen(self.url_for(method, **extra), timeout=timeout, context=context) as r:
+                data = json.loads(r.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"server answered {e.code}") from None
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"can't reach the server ({e.reason})") from None
+        response = data.get('subsonic-response', {})
+        if response.get('status') != 'ok':
+            raise RuntimeError((response.get('error') or {}).get('message') or "the server refused")
+        return response
+
+    @staticmethod
+    def to_track(song):
+        title = song.get('title') or 'Unknown'
+        track = make_track(f"{song['artist']} - {title}" if song.get('artist') else title,
+                           'subsonic', str(song['id']), song.get('duration'))
+        track['album'] = song.get('album') or ''
+        return track
+
+    def ping(self):
+        self.call('ping')
+
+    def search(self, query, count=40):
+        found = self.call('search3', query=query, songCount=count, artistCount=0, albumCount=0)
+        return [self.to_track(s) for s in (found.get('searchResult3') or {}).get('song', [])]
+
+    def playlists(self):
+        return (self.call('getPlaylists').get('playlists') or {}).get('playlist', [])
+
+    def playlist_tracks(self, playlist_id):
+        return [self.to_track(s) for s in (self.call('getPlaylist', id=playlist_id).get('playlist') or {}).get('entry', [])]
+
+    def random_tracks(self, count=20):
+        return [self.to_track(s) for s in (self.call('getRandomSongs', size=count).get('randomSongs') or {}).get('song', [])]
+
+    def stream_url(self, song_id):
+        return self.url_for('stream', id=song_id, format='raw')  # original file, ffmpeg decodes it
+
+    def scrobble(self, song_id):
+        self.call('scrobble', id=song_id, submission='true')
 
 
 class DJEngine:
@@ -147,6 +241,16 @@ class DJEngine:
         self.search_busy = False
         self.ytdlp_busy = False
         self.ffmpeg_busy = False
+        # Song requests waiting for the DJ's OK (not saved - they go away when the TTS closes)
+        self.pending = []
+        self.pending_version = 0
+        # Subsonic / Navidrome library
+        self.subsonic = None
+        self.library_results = []
+        self.library_playlists = []    # [(id, name, song count)]
+        self.library_version = 0
+        self.library_busy = False
+        self._load_subsonic()
 
         self._play_next_track = None   # "Play Now" bypasses shuffle
         self._new_track = False        # announce "now playing" once per track, not after seeks
@@ -194,7 +298,8 @@ class DJEngine:
     def _queue_changed(self, save=True):
         self.queue_version += 1
         if save:
-            self.settings['queue'] = [dict(t) for t in self.queue[:1000]]
+            # keys starting with _ are per-session (e.g. a cached YouTube stream link) and aren't saved
+            self.settings['queue'] = [{k: v for k, v in t.items() if not k.startswith('_')} for t in self.queue[:1000]]
             self._save()
 
     # ------------------------------------------------------------------ tools
@@ -290,11 +395,16 @@ class DJEngine:
     # ------------------------------------------------------------------ queue editing
     def add_tracks(self, tracks, front=False):
         with self._lock:
+            was_empty = not self.queue and self.current is None and not self._play_next_track
             if front:
                 self.queue[0:0] = tracks
             else:
                 self.queue.extend(tracks)
             self._queue_changed()
+        # Auto-play: nothing was queued and nothing playing, so start. (If you pressed Stop with songs still
+        # queued, the queue isn't empty and adding more won't start it.)
+        if tracks and was_empty and self.state == 'stopped' and self.get('autoplay'):
+            self.play()
 
     def add_files(self, paths):
         """Add audio files now (named from the file); lengths and tags are filled in by a background probe"""
@@ -511,6 +621,8 @@ class DJEngine:
                         self.state, self.position = 'stopped', 0.0
                         failures = 0
                         break
+                    if outcome == 'ended':
+                        self._scrobble(track)  # play count on the music server, if that's switched on
                     if outcome == 'ended' and self.get('repeat') == 'one':
                         continue  # same track again from the top
                     self.history.append(track)
@@ -533,28 +645,44 @@ class DJEngine:
         self.position = start
         source = track['target']
         if track['source'] == 'youtube':
-            self.status = f"Loading {track['title']} from YouTube..."
-            info, error = self._youtube_info(source, stream_url=True)
-            if self._command:
-                return self._command
-            if not info:
-                self.status = f"Couldn't load {track['title']}: {error}"
+            cached = track.get('_stream')
+            if cached and time.time() - cached[1] < 1800:
+                source = cached[0]  # looked up in the last 30 min (seek / bass change) - links last hours
+            else:
+                self.status = f"Loading {track['title']} from YouTube..."
+                info, error = self._youtube_info(source, stream_url=True)
+                if self._command:
+                    return self._command
+                if not info:
+                    self.status = f"Couldn't load {track['title']}: {error}"
+                    return 'error'
+                source = info['url']
+                track['_stream'] = (source, time.time())
+                if not track.get('duration') and info.get('duration'):
+                    track['duration'] = info['duration']
+        elif track['source'] == 'subsonic':
+            if not self.subsonic:
+                self.status = f"Can't play {track['title']}: not connected to your music server (DJ > My library)"
                 return 'error'
-            source = info['url']
-            if not track.get('duration') and info.get('duration'):
-                track['duration'] = info['duration']
+            source = self.subsonic.stream_url(track['target'])
         elif not os.path.isfile(source):
             self.status = f"File not found: {source}"
             return 'error'
 
         cmd = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin']
-        if track['source'] == 'youtube':
+        if track['source'] in ('youtube', 'subsonic'):
             cmd += ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5']
         if start > 0:
             cmd += ['-ss', f'{start:.2f}']
         cmd += ['-i', source, '-vn', '-sn', '-dn']
+        filters = []
+        bass = float(self.get('bass_db') or 0)
+        if bass:
+            filters.append(f'bass=g={bass:g}:f=160:width_type=o:w=1')  # low shelf below ~160 Hz
         if self.get('normalize'):
-            cmd += ['-af', 'dynaudnorm=f=200:g=11:p=0.9']
+            filters.append('dynaudnorm=f=200:g=11:p=0.9')
+        if filters:
+            cmd += ['-af', ','.join(filters)]
         cmd += ['-f', 's16le', '-acodec', 'pcm_s16le', '-ac', str(CHANNELS), '-ar', str(RATE), 'pipe:1']
 
         errors = deque(maxlen=6)
@@ -810,50 +938,224 @@ class DJEngine:
                 self.ytdlp_busy = False
         threading.Thread(target=work, daemon=True).start()
 
+    # ------------------------------------------------------------------ Subsonic / Navidrome library
+    def _load_subsonic(self):
+        saved = self.settings.get('subsonic') or {}
+        self.subsonic = (SubsonicClient(saved['url'], saved['user'], saved['token'], saved['salt'], saved.get('insecure', False))
+                         if saved.get('token') and saved.get('url') else None)
+
+    def _library_job(self, work, busy_text):
+        """Run a library call in the background; errors end up in status"""
+        def run():
+            self.library_busy = True
+            self.status = busy_text
+            try:
+                work()
+            except Exception as e:
+                self.status = f"Library: {e}"
+            finally:
+                self.library_busy = False
+                self.library_version += 1
+        threading.Thread(target=run, daemon=True).start()
+
+    def subsonic_connect(self, url, user, password, insecure=False):
+        """Sign in and remember the server. The password is only used to make the token here."""
+        def work():
+            token, salt = SubsonicClient.make_token(password)
+            client = SubsonicClient(url, user.strip(), token, salt, insecure)
+            if not client.url or not client.user:
+                raise RuntimeError("fill in the server address and user name")
+            client.ping()
+            self.subsonic = client
+            self.settings['subsonic'] = {'url': client.url, 'user': client.user, 'token': token, 'salt': salt,
+                                         'insecure': insecure}
+            self._save()
+            self.library_playlists = [(str(p['id']), p.get('name', '?'), p.get('songCount', 0)) for p in client.playlists()]
+            self.status = f"Connected to {client.url} as {client.user}"
+        self._library_job(work, "Connecting to your music server...")
+
+    def subsonic_disconnect(self):
+        self.subsonic = None
+        self.settings.pop('subsonic', None)
+        self._save()
+        self.library_results, self.library_playlists = [], []
+        self.library_version += 1
+        self.status = "Disconnected from the music server"
+
+    def library_refresh_playlists(self):
+        if not self.subsonic:
+            return
+        def work():
+            self.library_playlists = [(str(p['id']), p.get('name', '?'), p.get('songCount', 0)) for p in self.subsonic.playlists()]
+            self.status = f"{len(self.library_playlists)} playlist(s)"
+        self._library_job(work, "Loading playlists...")
+
+    def library_search(self, query):
+        if not self.subsonic or not query.strip():
+            return
+        def work():
+            self.library_results = self.subsonic.search(query.strip())
+            self.status = f"{len(self.library_results)} song(s) in your library"
+        self._library_job(work, f"Searching your library for {query}...")
+
+    def library_add_random(self, count=20):
+        if not self.subsonic:
+            return
+        def work():
+            tracks = self.subsonic.random_tracks(count)
+            self.add_tracks(tracks)
+            self.status = f"Added {len(tracks)} random song(s) from your library"
+        self._library_job(work, "Picking random songs...")
+
+    def library_add_playlist(self, playlist_id, name):
+        if not self.subsonic:
+            return
+        def work():
+            tracks = self.subsonic.playlist_tracks(playlist_id)
+            self.add_tracks(tracks)
+            self.status = f"Added {len(tracks)} song(s) from {name}"
+        self._library_job(work, f"Loading {name}...")
+
+    def _scrobble(self, track):
+        client = self.subsonic
+        if client and self.get('scrobble') and track.get('source') == 'subsonic':
+            threading.Thread(target=lambda: self._quiet(client.scrobble, track['target']), daemon=True).start()
+
+    @staticmethod
+    def _quiet(func, *args):
+        try:
+            func(*args)
+        except Exception as e:
+            logger.debug(f"DJ: {e}")
+
     # ------------------------------------------------------------------ chat song requests
     def request_allowed(self, is_admin):
         mode = self.get('requests')
         return mode == 'everyone' or (mode == 'admins' and is_admin)
 
     def request(self, username, query, is_admin, reply):
-        """Chat '!sr <YouTube link or search words>'. reply(text) gets the outcome (called from a worker
-        thread). Returns False if requests are off for this person, so the caller can ignore the message."""
+        """Chat '!sr <YouTube link or search words>'. The outcome goes to
+        reply(text, outcome, title=None, reason=None) - called from a worker thread - where outcome is
+        'accepted' or 'denied', text is for the TTS window and reason is short and speakable ("it's too long").
+        Returns False if requests are off for this person, so the caller can ignore the message."""
         if not self.request_allowed(is_admin):
             return False
+
+        def deny(text, reason):
+            reply(text, 'denied', reason=reason)
+
+        needs_ok = self.get('request_approval') and not (is_admin and self.get('approval_admins_skip'))
+
+        def accept(track, where=''):
+            """Queue the pick - or, with approval on, hold it in the Requests tab until the DJ decides"""
+            track['requested_by'] = username
+            label = f"{track['title']} ({fmt_time(track.get('duration'))}){where}"
+            if needs_ok:
+                track['_reply'] = reply  # used when the DJ approves/denies (not saved: starts with _)
+                with self._lock:
+                    self.pending.append(track)
+                    self.pending_version += 1
+                reply(f"{username} requested {label} - waiting for your OK (DJ > Requests, or !approve / !deny)",
+                      'pending', title=track['title'])
+            else:
+                self.add_tracks([track])
+                reply(f"{username} requested {label}", 'accepted', title=track['title'])
+
         query = query.strip()
         if not query:
-            reply(f"{username}: use !sr with a YouTube link or song name")
+            deny(f"{username}: use !sr with a YouTube link or song name", "say !sr and a song name or YouTube link")
             return True
         if not is_admin:
-            waiting = sum(1 for t in self.queue if t.get('requested_by') == username)
-            if waiting >= self.get('request_limit'):
-                reply(f"{username} already has a song waiting")
+            waiting = sum(1 for t in self.queue + self.pending if t.get('requested_by') == username)
+            limit = int(self.get('request_limit') or 0)
+            if limit and waiting >= limit:
+                songs = "a song" if limit == 1 else f"{limit} songs"
+                deny(f"{username} already has {songs} waiting", f"you already have {songs} waiting")
                 return True
-        if query.lower().startswith(('http://', 'https://')):
+        is_link = query.lower().startswith(('http://', 'https://'))
+        if is_link:
             if not YOUTUBE_URL.match(query):
-                reply(f"{username}: only YouTube links can be requested")
+                deny(f"{username}: only YouTube links can be requested", "only YouTube links work")
                 return True
             target = query
         else:
             target = f'ytsearch1:{query}'
+        source = self.get('request_source')
+        use_library = not is_link and source in ('library', 'library_first')
+        if use_library and not self.subsonic and source == 'library':
+            deny(f"{username}: song requests come from the library, but it isn't connected",
+                 "the music library isn't connected")
+            return True
+
+        def refusal(duration, is_live=False):
+            """(chat text, spoken reason) if a non-admin's pick isn't allowed, else None"""
+            if is_admin:
+                return None
+            if is_live or duration is None:
+                return f"{username}: live streams can't be requested", "live streams aren't allowed"
+            limit = self.get('request_max_minutes')
+            if limit and duration > limit * 60:
+                return (f"{username}'s request is too long ({fmt_time(duration)}, limit {limit} min)",
+                        f"it's too long, the limit is {limit} minutes")
+            return None
 
         def work():
+            # Words: the music library first (if set up that way), then YouTube
+            if use_library and self.subsonic:
+                try:
+                    found = self.subsonic.search(query, count=5)
+                except Exception as e:
+                    found = []
+                    logger.warning(f"DJ: library search for a request failed: {e}")
+                if found:
+                    pick = found[0]
+                    refused = refusal(pick.get('duration'))
+                    if refused:
+                        deny(*refused)
+                        return
+                    accept(pick, " from the library")
+                    return
+                if source == 'library':
+                    deny(f"Couldn't find {query} in the library for {username}", "that isn't in the library")
+                    return
             info, error = self._youtube_info(target)
             if not info:
-                reply(f"Couldn't find a song for {username}" + (f" ({error})" if error else ""))
+                deny(f"Couldn't find a song for {username}" + (f" ({error})" if error else ""), "nothing was found")
                 return
-            if not is_admin:
-                if info['is_live'] or info['duration'] is None:
-                    reply(f"{username}: live streams can't be requested")
-                    return
-                limit = self.get('request_max_minutes')
-                if limit and info['duration'] > limit * 60:
-                    reply(f"{username}'s request is too long ({fmt_time(info['duration'])}, limit {limit} min)")
-                    return
-            self.add_tracks([make_track(info['title'], 'youtube', info['webpage_url'], info['duration'], username)])
-            reply(f"{username} requested {info['title']} ({fmt_time(info['duration'])})")
+            refused = refusal(info['duration'], info['is_live'])
+            if refused:
+                deny(*refused)
+                return
+            accept(make_track(info['title'], 'youtube', info['webpage_url'], info['duration'], username))
         threading.Thread(target=work, daemon=True).start()
         return True
+
+    def approve_request(self, index=0):
+        """DJ said yes: the held request goes into the queue and the player hears it was approved"""
+        with self._lock:
+            if not (0 <= index < len(self.pending)):
+                return None
+            track = self.pending.pop(index)
+            self.pending_version += 1
+        reply = track.pop('_reply', None)
+        self.add_tracks([track])
+        self.status = f"Approved {track['requested_by']}'s request: {track['title']}"
+        if reply:
+            reply(f"Approved {track['requested_by']}'s request: {track['title']}", 'approved', title=track['title'])
+        return track
+
+    def deny_request(self, index=0, reason="the DJ said no"):
+        """DJ said no: the held request is dropped and the player hears why"""
+        with self._lock:
+            if not (0 <= index < len(self.pending)):
+                return None
+            track = self.pending.pop(index)
+            self.pending_version += 1
+        reply = track.pop('_reply', None)
+        self.status = f"Denied {track['requested_by']}'s request: {track['title']}"
+        if reply:
+            reply(f"Denied {track['requested_by']}'s request: {track['title']}", 'dj_denied', reason=reason)
+        return track
 
     # ------------------------------------------------------------------ devices
     @staticmethod
@@ -887,17 +1189,21 @@ class DJWindow:
 
         self.win = tk.Toplevel(root)
         self.win.title("DJ")
-        self.win.geometry("880x760")
-        self.win.minsize(760, 640)
+        if ui_theme:
+            ui_theme.size_window(self.win, 960, 760, root, minsize=(760, 640))
+        else:
+            self.win.geometry("880x760")
+            self.win.minsize(760, 640)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
 
+        self._library_seen = -1
         self._build_now_playing()
         self._build_queue()
-        self._build_youtube()
+        self._build_sources()
         self._build_options()
         self.status_var = tk.StringVar()
-        ttk.Label(self.win, textvariable=self.status_var, foreground='gray').pack(fill=tk.X, padx=10, pady=(0, 2))
-        ttk.Label(self.win, foreground='gray', text=(
+        ttk.Label(self.win, textvariable=self.status_var, style='Hint.TLabel').pack(fill=tk.X, padx=10, pady=(0, 2))
+        ttk.Label(self.win, style='Hint.TLabel', text=(
             "Keys: Space play/pause   Ctrl+Right next   Ctrl+Left previous   Ctrl+S stop   "
             "Del remove   Ctrl+Up/Down move   Ctrl+O add files   Ctrl+F YouTube box")).pack(fill=tk.X, padx=10, pady=(0, 6))
         self._bind_keys()
@@ -988,9 +1294,174 @@ class DJWindow:
         self.queue_info_var = tk.StringVar()
         ttk.Label(buttons, textvariable=self.queue_info_var).pack(side=tk.RIGHT, padx=4)
 
-    def _build_youtube(self):
-        frame = ttk.LabelFrame(self.win, text="YouTube")
-        frame.pack(fill=tk.X, padx=10, pady=5)
+    def _build_sources(self):
+        """Where music comes from besides files: YouTube and the Subsonic/Navidrome library, as tabs"""
+        notebook = ttk.Notebook(self.win)
+        notebook.pack(fill=tk.X, padx=10, pady=5)
+        youtube_tab = ttk.Frame(notebook)
+        library_tab = ttk.Frame(notebook)
+        self.requests_tab = ttk.Frame(notebook)
+        notebook.add(youtube_tab, text="YouTube")
+        notebook.add(library_tab, text="My library (Subsonic / Navidrome)")
+        notebook.add(self.requests_tab, text="Requests")
+        self.sources_notebook = notebook
+        self._build_youtube(youtube_tab)
+        self._build_library(library_tab)
+        self._build_requests(self.requests_tab)
+
+    def _build_requests(self, frame):
+        """Song requests waiting for the DJ's OK (when 'Requests wait for my OK' is on)"""
+        self._pending_seen = -1
+        self.pending_tree = ttk.Treeview(frame, columns=('who', 'song', 'length', 'from'), show='headings', height=6)
+        for col, text, width in (('who', 'Requested by', 130), ('song', 'Song', 430), ('length', 'Length', 70),
+                                 ('from', 'From', 80)):
+            self.pending_tree.heading(col, text=text)
+            self.pending_tree.column(col, width=width, stretch=(col == 'song'), anchor=tk.E if col == 'length' else tk.W)
+        self.pending_tree.pack(fill=tk.X, padx=6, pady=(6, 2))
+        self.pending_tree.bind('<Double-1>', lambda ev: self._pending_open())
+        row = ttk.Frame(frame)
+        row.pack(fill=tk.X, padx=6, pady=(2, 6))
+        ttk.Button(row, text="✓ Approve", command=self._pending_approve).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row, text="✗ Deny", command=self._pending_deny).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row, text="Open link", command=self._pending_open).pack(side=tk.LEFT, padx=(12, 2))
+        ttk.Label(row, style='Hint.TLabel', text="In game: !approve / !deny (admins) handle the oldest request").pack(side=tk.LEFT, padx=10)
+
+    def _pending_selected(self):
+        sel = self.pending_tree.selection()
+        return self.pending_tree.index(sel[0]) if sel else (0 if self.engine.pending else None)
+
+    def _pending_approve(self):
+        index = self._pending_selected()
+        if index is not None:
+            self.engine.approve_request(index)
+
+    def _pending_deny(self):
+        index = self._pending_selected()
+        if index is not None:
+            self.engine.deny_request(index)
+
+    def _pending_open(self):
+        """Check a YouTube request in the browser before deciding"""
+        index = self._pending_selected()
+        if index is None or index >= len(self.engine.pending):
+            return
+        track = self.engine.pending[index]
+        if track.get('source') == 'youtube' and str(track.get('target', '')).startswith('https://'):
+            import webbrowser
+            webbrowser.open(track['target'])
+        else:
+            self.engine.status = "That one is from your library - no link to open"
+
+    def _redraw_pending(self):
+        e = self.engine
+        self._pending_seen = e.pending_version
+        self.pending_tree.delete(*self.pending_tree.get_children())
+        for track in list(e.pending):
+            self.pending_tree.insert('', tk.END, values=(track.get('requested_by') or '', track['title'],
+                                                         fmt_time(track.get('duration')),
+                                                         {'youtube': 'YouTube', 'subsonic': 'Library'}.get(track['source'], '')))
+        count = len(e.pending)
+        self.sources_notebook.tab(self.requests_tab, text=f"Requests ({count})" if count else "Requests")
+
+    def _build_library(self, frame):
+        e = self.engine
+        saved = e.settings.get('subsonic') or {}
+
+        # Sign-in row (shown while not connected)
+        self.lib_login = ttk.Frame(frame)
+        ttk.Label(self.lib_login, text="Server").pack(side=tk.LEFT)
+        self.lib_url = tk.StringVar(value=saved.get('url', 'http://'))
+        ttk.Entry(self.lib_login, textvariable=self.lib_url, width=30).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(self.lib_login, text="User").pack(side=tk.LEFT)
+        self.lib_user = tk.StringVar(value=saved.get('user', ''))
+        ttk.Entry(self.lib_login, textvariable=self.lib_user, width=14).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(self.lib_login, text="Password").pack(side=tk.LEFT)
+        self.lib_pass = tk.StringVar()
+        pass_entry = ttk.Entry(self.lib_login, textvariable=self.lib_pass, width=14, show='*')
+        pass_entry.pack(side=tk.LEFT, padx=4)
+        pass_entry.bind('<Return>', lambda ev: self._lib_connect())
+        self.lib_insecure = tk.BooleanVar(value=saved.get('insecure', False))
+        ttk.Checkbutton(self.lib_login, text="self-signed HTTPS", variable=self.lib_insecure).pack(side=tk.LEFT, padx=4)
+        ttk.Button(self.lib_login, text="Connect", command=self._lib_connect).pack(side=tk.LEFT, padx=4)
+
+        # Connected row
+        self.lib_connected = ttk.Frame(frame)
+        self.lib_conn_var = tk.StringVar()
+        ttk.Label(self.lib_connected, textvariable=self.lib_conn_var).pack(side=tk.LEFT)
+        ttk.Button(self.lib_connected, text="Disconnect", command=e.subsonic_disconnect).pack(side=tk.LEFT, padx=8)
+        self.lib_hint = ttk.Label(frame, style='Hint.TLabel', text=(
+            "Your password isn't saved - only a sign-in token made from it (Subsonic token login)."))
+
+        self.lib_tools = ttk.Frame(frame)
+        self.lib_query = tk.StringVar()
+        query_entry = ttk.Entry(self.lib_tools, textvariable=self.lib_query, width=30)
+        query_entry.pack(side=tk.LEFT)
+        query_entry.bind('<Return>', lambda ev: e.library_search(self.lib_query.get()))
+        ttk.Button(self.lib_tools, text="Search", command=lambda: e.library_search(self.lib_query.get())).pack(side=tk.LEFT, padx=4)
+        ttk.Button(self.lib_tools, text="+ 20 random", command=e.library_add_random).pack(side=tk.LEFT, padx=(8, 4))
+        ttk.Label(self.lib_tools, text="Playlist").pack(side=tk.LEFT, padx=(12, 2))
+        self.lib_playlist = ttk.Combobox(self.lib_tools, width=28, state='readonly')
+        self.lib_playlist.pack(side=tk.LEFT)
+        ttk.Button(self.lib_tools, text="+ Add playlist", command=self._lib_add_playlist).pack(side=tk.LEFT, padx=4)
+        ttk.Button(self.lib_tools, text="⟳", width=3, command=e.library_refresh_playlists).pack(side=tk.LEFT)
+
+        self.lib_tree = ttk.Treeview(frame, columns=('title', 'album', 'length'), show='headings', height=5,
+                                     selectmode='extended')
+        for col, text, width in (('title', 'Song', 420), ('album', 'Album', 180), ('length', 'Length', 70)):
+            self.lib_tree.heading(col, text=text)
+            self.lib_tree.column(col, width=width, stretch=(col != 'length'), anchor=tk.E if col == 'length' else tk.W)
+        self.lib_tree.bind('<Double-1>', lambda ev: self._lib_add_selected(front=False))
+        self.lib_buttons = ttk.Frame(frame)
+        ttk.Button(self.lib_buttons, text="+ Add to Queue", command=lambda: self._lib_add_selected(front=False)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(self.lib_buttons, text="Play Next", command=lambda: self._lib_add_selected(front=True)).pack(side=tk.LEFT, padx=2)
+        self._lib_layout(connected=None)
+
+    def _lib_layout(self, connected):
+        """Swap the sign-in row and the library tools depending on whether we're connected"""
+        if connected == getattr(self, '_lib_shown', 'unset'):
+            return
+        self._lib_shown = connected
+        for w in (self.lib_login, self.lib_connected, self.lib_hint, self.lib_tools, self.lib_tree, self.lib_buttons):
+            w.pack_forget()
+        if connected:
+            self.lib_connected.pack(fill=tk.X, padx=6, pady=(6, 2))
+            self.lib_tools.pack(fill=tk.X, padx=6, pady=2)
+            self.lib_tree.pack(fill=tk.X, padx=6, pady=2)
+            self.lib_buttons.pack(fill=tk.X, padx=6, pady=(2, 6))
+        else:
+            self.lib_login.pack(fill=tk.X, padx=6, pady=(8, 2))
+            self.lib_hint.pack(anchor=tk.W, padx=6, pady=(2, 8))
+
+    def _lib_connect(self):
+        password = self.lib_pass.get()
+        self.lib_pass.set('')  # don't keep it in the window
+        self.engine.subsonic_connect(self.lib_url.get(), self.lib_user.get(), password, self.lib_insecure.get())
+
+    def _lib_add_playlist(self):
+        index = self.lib_playlist.current()
+        if 0 <= index < len(self.engine.library_playlists):
+            playlist_id, name, _ = self.engine.library_playlists[index]
+            self.engine.library_add_playlist(playlist_id, name)
+
+    def _lib_add_selected(self, front):
+        results = self.engine.library_results
+        picked = [dict(results[self.lib_tree.index(i)]) for i in self.lib_tree.selection()
+                  if self.lib_tree.index(i) < len(results)]
+        if picked:
+            self.engine.add_tracks(picked, front=front)
+            self.engine.status = f"Added {len(picked)} song(s)" + (" to play next" if front else "")
+
+    def _redraw_library(self):
+        e = self.engine
+        self._library_seen = e.library_version
+        self.lib_tree.delete(*self.lib_tree.get_children())
+        for track in e.library_results:
+            self.lib_tree.insert('', tk.END, values=(track['title'], track.get('album', ''), fmt_time(track.get('duration'))))
+        self.lib_playlist['values'] = [f"{name} ({count})" for _, name, count in e.library_playlists]
+        if e.library_playlists and self.lib_playlist.current() < 0:
+            self.lib_playlist.current(0)
+
+    def _build_youtube(self, frame):
         row = ttk.Frame(frame)
         row.pack(fill=tk.X, padx=6, pady=(6, 2))
         self.yt_var = tk.StringVar()
@@ -998,7 +1469,7 @@ class DJWindow:
         self.yt_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.yt_entry.bind('<Return>', lambda e: self._youtube_go())
         ttk.Button(row, text="Add link / Search", command=self._youtube_go).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Label(frame, foreground='gray', text="Paste a YouTube link to add it, or type words to search").pack(anchor=tk.W, padx=6)
+        ttk.Label(frame, style='Hint.TLabel', text="Paste a YouTube link to add it, or type words to search").pack(anchor=tk.W, padx=6)
 
         self.results_tree = ttk.Treeview(frame, columns=('title', 'length'), show='headings', height=5)
         self.results_tree.heading('title', text='Search results')
@@ -1015,7 +1486,7 @@ class DJWindow:
         self.ytdlp_btn = ttk.Button(row2, text="Update yt-dlp", command=self.engine.update_ytdlp)
         self.ytdlp_btn.pack(side=tk.RIGHT, padx=2)
         self.ytdlp_var = tk.StringVar()
-        ttk.Label(row2, textvariable=self.ytdlp_var, foreground='gray').pack(side=tk.RIGHT, padx=6)
+        ttk.Label(row2, textvariable=self.ytdlp_var, style='Hint.TLabel').pack(side=tk.RIGHT, padx=6)
 
     def _build_options(self):
         frame = ttk.LabelFrame(self.win, text="Options")
@@ -1040,17 +1511,36 @@ class DJWindow:
         ttk.Checkbutton(row, text="Even out loudness between songs (starts with the next song)",
                         variable=self.normalize_var,
                         command=lambda: e.set('normalize', self.normalize_var.get())).pack(side=tk.LEFT)
+        self.autoplay_var = tk.BooleanVar(value=e.get('autoplay'))
+        ttk.Checkbutton(row, text="Start playing when something is added to an empty queue",
+                        variable=self.autoplay_var,
+                        command=lambda: e.set('autoplay', self.autoplay_var.get())).pack(side=tk.LEFT, padx=(16, 0))
+
+        row = ttk.Frame(frame)
+        row.pack(fill=tk.X, padx=6, pady=2)
+        ttk.Label(row, text="Bass").pack(side=tk.LEFT)
+        self.bass_var = tk.DoubleVar(value=float(e.get('bass_db')))
+        bass_scale = ttk.Scale(row, from_=-15, to=6, variable=self.bass_var, orient=tk.HORIZONTAL, length=180,
+                               command=lambda v: self.bass_label.config(text=f"{round(float(v)):+d} dB"))
+        bass_scale.pack(side=tk.LEFT, padx=6)
+        bass_scale.bind('<ButtonRelease-1>', lambda ev: self._apply_bass())
+        self.bass_label = ttk.Label(row, text=f"{round(self.bass_var.get()):+d} dB", width=7)
+        self.bass_label.pack(side=tk.LEFT)
+        ttk.Button(row, text="Reset", width=6, command=lambda: (self.bass_var.set(0), self._apply_bass())).pack(side=tk.LEFT)
+        ttk.Label(row, text="TF2's voice codec is boomy - try around -6 dB", style='Hint.TLabel').pack(side=tk.LEFT, padx=8)
 
         row = ttk.Frame(frame)
         row.pack(fill=tk.X, padx=6, pady=2)
         self.announce_var = tk.BooleanVar(value=e.get('announce'))
-        ttk.Checkbutton(row, text='Announce "now playing" with', variable=self.announce_var,
+        ttk.Checkbutton(row, text='Announce "now playing"', variable=self.announce_var,
                         command=lambda: e.set('announce', self.announce_var.get())).pack(side=tk.LEFT)
-        self.announce_voice = ttk.Combobox(row, values=self._voice_names(), width=40, state='readonly')
+        ttk.Label(row, text="   DJ voice:").pack(side=tk.LEFT)
+        self.announce_voice = ttk.Combobox(row, values=self._voice_names(), width=36, state='readonly')
         self.announce_voice.set(e.get('announce_voice'))
         self.announce_voice.bind('<<ComboboxSelected>>', lambda ev: e.set('announce_voice', self.announce_voice.get()))
         self.announce_voice.pack(side=tk.LEFT, padx=4)
-        ttk.Label(row, text="(Default = announcement voice; needs the TTS started)", foreground='gray').pack(side=tk.LEFT)
+        ttk.Label(row, text="(now playing + song-request messages; Default = Announcements tab voice)",
+                  style='Hint.TLabel').pack(side=tk.LEFT)
 
         row = ttk.Frame(frame)
         row.pack(fill=tk.X, padx=6, pady=2)
@@ -1067,6 +1557,33 @@ class DJWindow:
         ttk.Label(row, text="min (0 = any; admins have no limit)").pack(side=tk.LEFT)
 
         row = ttk.Frame(frame)
+        row.pack(fill=tk.X, padx=6, pady=2)
+        ttk.Label(row, text="!sr words search:").pack(side=tk.LEFT)
+        self.request_source_var = tk.StringVar(value=e.get('request_source'))
+        for value, text in (('youtube', 'YouTube'), ('library', 'My library'), ('library_first', 'My library, then YouTube')):
+            ttk.Radiobutton(row, text=text, value=value, variable=self.request_source_var,
+                            command=lambda: e.set('request_source', self.request_source_var.get())).pack(side=tk.LEFT, padx=4)
+        self.approval_var = tk.BooleanVar(value=e.get('request_approval'))
+        self.approval_admins_var = tk.BooleanVar(value=e.get('approval_admins_skip'))
+        approval_row = ttk.Frame(frame)
+        approval_row.pack(fill=tk.X, padx=6, pady=2)
+        ttk.Checkbutton(approval_row, text="Requests wait for my OK (Requests tab, or !approve / !deny)",
+                        variable=self.approval_var,
+                        command=lambda: e.set('request_approval', self.approval_var.get())).pack(side=tk.LEFT)
+        ttk.Checkbutton(approval_row, text="except admins' requests", variable=self.approval_admins_var,
+                        command=lambda: e.set('approval_admins_skip', self.approval_admins_var.get())).pack(side=tk.LEFT, padx=12)
+        ttk.Label(approval_row, text="Waiting songs per person").pack(side=tk.LEFT, padx=(12, 2))
+        self.request_limit_var = tk.StringVar(value=str(e.get('request_limit')))
+        limit_box = ttk.Spinbox(approval_row, from_=0, to=20, width=4, textvariable=self.request_limit_var,
+                                command=self._save_request_limit)
+        limit_box.pack(side=tk.LEFT, padx=2)
+        limit_box.bind('<FocusOut>', lambda ev: self._save_request_limit())
+        ttk.Label(approval_row, text="(0 = no limit; admins aren't limited)", style='Hint.TLabel').pack(side=tk.LEFT)
+        self.scrobble_var = tk.BooleanVar(value=e.get('scrobble'))
+        ttk.Checkbutton(row, text="Tell my music server what was played (scrobble)", variable=self.scrobble_var,
+                        command=lambda: e.set('scrobble', self.scrobble_var.get())).pack(side=tk.LEFT, padx=(16, 0))
+
+        row = ttk.Frame(frame)
         row.pack(fill=tk.X, padx=6, pady=(2, 6))
         ttk.Label(row, text="Output:").pack(side=tk.LEFT)
         self.output_combo = ttk.Combobox(row, width=55, state='readonly',
@@ -1075,13 +1592,13 @@ class DJWindow:
         self.output_combo.bind('<<ComboboxSelected>>', lambda ev: self._set_output())
         self.output_combo.pack(side=tk.LEFT, padx=4)
         ttk.Label(row, text="(pick your speakers here to test without going through the mic)",
-                  foreground='gray').pack(side=tk.LEFT)
+                  style='Hint.TLabel').pack(side=tk.LEFT)
 
         row = ttk.Frame(frame)
         row.pack(fill=tk.X, padx=6, pady=(0, 6))
         ttk.Label(row, text="ffmpeg (plays all music and sounds):").pack(side=tk.LEFT)
         self.ffmpeg_var = tk.StringVar()
-        ttk.Label(row, textvariable=self.ffmpeg_var, foreground='gray').pack(side=tk.LEFT, padx=6)
+        ttk.Label(row, textvariable=self.ffmpeg_var, style='Hint.TLabel').pack(side=tk.LEFT, padx=6)
         self.ffmpeg_btn = ttk.Button(row, text="Download ffmpeg", command=e.update_ffmpeg)
         self.ffmpeg_btn.pack(side=tk.LEFT, padx=4)
 
@@ -1118,11 +1635,27 @@ class DJWindow:
         except ValueError:
             self.duck_level_var.set(str(self.engine.get('duck_level')))
 
+    def _save_request_limit(self):
+        try:
+            self.engine.set('request_limit', max(0, min(20, int(self.request_limit_var.get()))))
+        except ValueError:
+            self.request_limit_var.set(str(self.engine.get('request_limit')))
+
     def _save_max_len(self):
         try:
             self.engine.set('request_max_minutes', max(0, int(self.max_len_var.get())))
         except ValueError:
             self.max_len_var.set(str(self.engine.get('request_max_minutes')))
+
+    def _apply_bass(self):
+        """Save the bass setting; a playing song picks it up right away (ffmpeg restarts where it was)"""
+        value = int(round(self.bass_var.get()))
+        self.bass_var.set(value)
+        self.bass_label.config(text=f"{value:+d} dB")
+        if value != self.engine.get('bass_db'):
+            self.engine.set('bass_db', value)
+            if self.engine.state in ('playing', 'paused'):
+                self.engine.seek(self.engine.position)
 
     def _set_output(self):
         choice = self.output_combo.get()
@@ -1196,7 +1729,7 @@ class DJWindow:
         total = 0.0
         for n, track in enumerate(list(self.engine.queue), 1):
             total += track.get('duration') or 0
-            title = track['title'] + ("  [YouTube]" if track['source'] == 'youtube' else "")
+            title = track['title'] + {'youtube': "  [YouTube]", 'subsonic': "  [Library]"}.get(track['source'], "")
             self.queue_tree.insert('', tk.END, values=(n, title, fmt_time(track.get('duration')),
                                                        track.get('requested_by') or ''))
         items = self.queue_tree.get_children()
@@ -1235,6 +1768,14 @@ class DJWindow:
                 self._redraw_queue()
             if e.search_version != self._search_seen:
                 self._redraw_results()
+            client = e.subsonic
+            self._lib_layout(connected=bool(client))
+            if client:
+                self.lib_conn_var.set(("Working... " if e.library_busy else "") + f"Connected to {client.url} as {client.user}")
+            if e.library_version != self._library_seen:
+                self._redraw_library()
+            if e.pending_version != self._pending_seen:
+                self._redraw_pending()
             self.status_var.set(e.status)
             have = e.ytdlp_path()
             self.ytdlp_var.set("working..." if e.ytdlp_busy else ("yt-dlp ready" if have else "yt-dlp not installed"))

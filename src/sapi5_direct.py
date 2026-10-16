@@ -37,6 +37,8 @@ class SAPI5Direct:
         self.worker_sapi = None
         self.stop_requested = False  # Flag to interrupt current speech
         self.worker_busy = False  # True while the worker is setting up or speaking a message
+        self.current_tag = None   # who the message being spoken now came from (for stop_tag)
+        self.cancelled_tag = None # (tag, time) of the last stop_tag, so a message about to start is skipped too
 
         try:
             # Initialize COM in main thread
@@ -188,15 +190,15 @@ class SAPI5Direct:
             logger.error(f"Failed to set output device: {e}")
             return False
             
-    def speak(self, text: str):
-        """Speak text using SAPI5 with async support"""
+    def speak(self, text: str, tag=None):
+        """Speak text using SAPI5 with async support. tag = who it's from (lets stop_tag cut just them)."""
         try:
             if not text:
                 return
                 
             # Queue speech for worker thread, with the voice/output chosen for THIS message - the worker may not
             # get to it until other messages have changed the current voice
-            self.speech_queue.put((text, self.current_voice_index, self.current_output_index))
+            self.speech_queue.put((text, self.current_voice_index, self.current_output_index, tag))
 
         except Exception as e:
             logger.error(f"Failed to queue speech: {e}")
@@ -204,6 +206,29 @@ class SAPI5Direct:
     def is_busy(self):
         """True while a message is being spoken or waiting in the worker's queue"""
         return self.worker_busy or not self.speech_queue.empty()
+
+    def stop_tag(self, tag):
+        """Cut off one sender (muted/blocked): drop their waiting messages and skip theirs if it's playing.
+        Everyone else's speech carries on."""
+        if tag is None:
+            return
+        kept = []
+        while True:
+            try:
+                item = self.speech_queue.get_nowait()
+            except queue.Empty:
+                break
+            if not (isinstance(item, tuple) and len(item) > 3 and item[3] == tag):
+                kept.append(item)
+        for item in kept:
+            self.speech_queue.put(item)
+        self.cancelled_tag = (tag, time.time())
+        if self.current_tag == tag and self.worker_sapi:
+            try:
+                self.worker_sapi.Skip("Sentence", 10000)
+                logger.info(f"Cut off current speech from {tag}")
+            except Exception as e:
+                logger.warning(f"Could not skip speech from {tag}: {e}")
             
     def speak_sync(self, text: str):
         """Speak text synchronously (blocks until complete)"""
@@ -305,11 +330,13 @@ class SAPI5Direct:
                 continue
 
             if isinstance(item, tuple):
-                text, voice_index, output_index = item
+                text, voice_index, output_index = item[:3]
+                tag = item[3] if len(item) > 3 else None
             else:  # plain text queued by older callers: use whatever is current
-                text, voice_index, output_index = item, self.current_voice_index, self.current_output_index
+                text, voice_index, output_index, tag = item, self.current_voice_index, self.current_output_index, None
 
             self.worker_busy = True
+            self.current_tag = tag
             try:
                 # Output and voice for this message. Kept apart from Speak so a voice that refuses to load
                 # (some IVONA voices do) or an unplugged device doesn't drop the message - it just uses the last one.
@@ -327,8 +354,12 @@ class SAPI5Direct:
                 except Exception as e:
                     logger.warning(f"Worker: could not set voice/output, using the previous one: {e}")
 
-                # A !stop that landed while we were setting up should still stop this message
+                # A !stop that landed while we were setting up should still stop this message - and so should
+                # a mute/block of this sender that happened just now
                 if self.stop_requested:
+                    continue
+                if tag is not None and self.cancelled_tag and self.cancelled_tag[0] == tag \
+                        and time.time() - self.cancelled_tag[1] < 2:
                     continue
 
                 # Speak with worker's SAPI instance
@@ -338,6 +369,7 @@ class SAPI5Direct:
                 logger.error(f"Worker error: {e}")
             finally:
                 self.worker_busy = False
+                self.current_tag = None
                 
     def get_voices(self):
         """Get available SAPI voices"""
@@ -514,21 +546,26 @@ class DirectOutputTTS:
         logger.info("DECtalk manager configured")
         
         
-    def speak(self, text: str, voice_type: str = None, use_sync: bool = False):
+    def speak(self, text: str, voice_type: str = None, use_sync: bool = False, tag=None):
         """Speak text with specified voice type
-        
+
         Args:
             text: Text to speak
             voice_type: Voice type (e.g., "dectalk")
             use_sync: Whether to use synchronous mode (ignored for compatibility)
+            tag: who the message is from, so stop_user() can cut just them off
         """
-        
+
         # Route to appropriate engine
         if voice_type == "dectalk" and self.dectalk_manager:
             self.dectalk_manager.speak(text)
         else:
             # Default to SAPI5
-            self.sapi.speak(text)
+            self.sapi.speak(text, tag=tag)
+
+    def stop_user(self, tag):
+        """Cut off one sender's Windows-voice speech (playing and waiting) - for mute/block"""
+        self.sapi.stop_tag(tag)
             
     def stop(self):
         """Stop all speech"""

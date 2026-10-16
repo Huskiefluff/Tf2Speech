@@ -110,6 +110,10 @@ a = Analysis(
         'drg_monitor',  # New DRG monitor for Deep Rock Galactic support
         'dj_player',  # DJ window (music + YouTube via ffmpeg/yt-dlp)
         'soundboard',  # chat soundboard (Sven ChatSounds style)
+        'textaloud_voice',  # TextAloud voices (Will From Afar) via TextAloud's automation interface
+        'ui_theme',  # Windows 11 look (Sun Valley theme), dark mode, scaling, scrolling tabs
+        'sv_ttk',
+        'voice_installer',  # Voices tab: Windows' extra voices, free Piper voices
         'urllib.request',
         'array',
     ],

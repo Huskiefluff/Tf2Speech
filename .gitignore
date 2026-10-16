@@ -233,3 +233,11 @@ voice_data/temp/
 *.bak-*
 *.before-*
 *.pyorig
+voices/
+add_windows_voices.reg
+undo_windows_voices.reg
+piper_windows_amd64.zip
+will_wip/
+ui_preview/
+dist_backup_*/
+*.reg

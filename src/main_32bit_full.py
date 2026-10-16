@@ -13,6 +13,7 @@ import re
 import shutil
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
+import ui_theme  # Windows 11 look, dark mode, scaling, scrolling tabs
 from pathlib import Path
 import threading
 import queue
@@ -79,7 +80,7 @@ from sapi5_direct import DirectOutputTTS
 
 # DJ music player and chat soundboard (optional - the TTS works without them)
 try:
-    from dj_player import DJEngine, DJWindow
+    from dj_player import DJEngine, DJWindow, clean_title
     DJ_AVAILABLE = True
 except Exception as e:
     logger.warning(f"DJ player not available: {e}")
@@ -90,6 +91,29 @@ try:
 except Exception as e:
     logger.warning(f"Soundboard not available: {e}")
     SOUNDBOARD_AVAILABLE = False
+try:
+    from textaloud_voice import TextAloudVoices, PREFIX as TEXTALOUD_PREFIX, is_installed as textaloud_installed
+    TEXTALOUD_AVAILABLE = True
+except Exception as e:
+    logger.warning(f"TextAloud voices not available: {e}")
+    TEXTALOUD_AVAILABLE = False
+    TEXTALOUD_PREFIX = "[TextAloud] "
+
+
+try:
+    import voice_installer  # more Windows voices, free Piper voices
+    from voice_installer import PIPER_PREFIX
+    VOICES_AVAILABLE = True
+except Exception as e:
+    logger.warning(f"Voice downloads not available: {e}")
+    VOICES_AVAILABLE = False
+    PIPER_PREFIX = "[Piper] "
+
+
+def is_special_voice(name):
+    """DECtalk, TextAloud and Piper voices are played by the speech thread itself, not by the Windows voice worker"""
+    return bool(name) and (name.startswith("[DECtalk] ") or name.startswith(TEXTALOUD_PREFIX)
+                           or name.startswith(PIPER_PREFIX))
 
 # Try to import DECtalk native with fallback
 try:
@@ -159,6 +183,10 @@ DECTALK_MARKUP = re.compile(r'\[:\s*(?:[a-zA-Z]{2,}|[a-zA-Z]\s*\d)[^\]]*\]|\[[^\
 DEFAULT_ANNOUNCEMENTS = {
     'MUTED': "has been muted",
     'SPAM MUTED': "muted for spamming",
+    'SONG REQUESTED': "requested {title}",                     # {title} = the song
+    'REQUEST DENIED': "your request was denied, {reason}",     # {reason} = e.g. "it's too long..."
+    'REQUEST PENDING': "requested {title}, waiting for approval",
+    'REQUEST APPROVED': "your request was approved, {title}",
 }
 
 # Games every config starts with; any others are added by the user in Settings
@@ -347,6 +375,7 @@ class TTSReplicaWASAPI:
         self._mute_lock = threading.Lock()
         self.muted_users = {u: t for u, t in self.config.get('muted_users', {}).items() if t > time.time()}
         self.spam_history = {}  # username -> recent [(time, spam_signature)] of their TTS messages
+        self._last_denied_announce = {}  # username -> when "request denied" was last spoken for them
 
         # Random voice for new users
         self.random_voice_enabled = self.config.get('random_voice_enabled', False)
@@ -363,6 +392,17 @@ class TTSReplicaWASAPI:
         self.dectalk_enabled = self.config.get('dectalk_enabled', True)  # Default to True so DECtalk is available
         # Plain float copy of the DECtalk volume slider for the speech thread (Tk variables aren't thread-safe)
         self.dectalk_volume = float(self.config.get('dectalk_volume', 0.7))
+        # TextAloud voices (Will From Afar etc.). Their names are remembered in config "textaloud_voices", so
+        # TextAloud only has to start when one of them actually speaks.
+        # It closes after config "textaloud_idle_minutes" (default 10) without use and starts again when needed.
+        self.textaloud = (TextAloudVoices(idle_minutes=float(self.config.get('textaloud_idle_minutes', 10)))
+                          if TEXTALOUD_AVAILABLE else None)
+        self.textaloud_enabled = bool(self.config.get('textaloud_enabled', True))
+        self.textaloud_volume = float(self.config.get('textaloud_volume', 1.0))
+        # Free Piper voices and the Windows-voices undo file live in the "voices" folder next to the TTS
+        self.voices_dir = Path(self.config.get('voices_dir') or self.get_config_path().parent / 'voices')
+        self.piper = voice_installer.PiperVoices(self.voices_dir) if VOICES_AVAILABLE else None
+        self.piper_volume = float(self.config.get('piper_volume', 1.0))
 
         # Now initialize audio AFTER all required attributes are set
         self.init_audio()
@@ -385,6 +425,10 @@ class TTSReplicaWASAPI:
         self.root.after(30000, self.tick_mutes)
         self.root.after(100, self.pump_ui_calls)
 
+        # First run with TextAloud installed: find its voices once (later runs use the saved list)
+        if self.textaloud_enabled and 'textaloud_voices' not in self.config:
+            self.refresh_textaloud_voices()
+
         # DJ music player: the window opens from the 🎵 DJ button; music keeps playing when it's closed
         self.dj = None
         self.dj_window = None
@@ -396,6 +440,7 @@ class TTSReplicaWASAPI:
                                    app_dir=self.get_config_path().parent)
             except Exception as e:
                 logger.error(f"DJ player failed to start: {e}")
+        self.root.after(1000, self.tick_dj_badge)
 
         # Chat soundboard: sounds in the "sounds" folder next to the TTS, triggered from chat
         if SOUNDBOARD_AVAILABLE:
@@ -662,6 +707,14 @@ class TTSReplicaWASAPI:
         self.dj_window = DJWindow(self.root, self.dj, voice_names=voices,
                                   on_close=lambda: setattr(self, 'dj_window', None))
 
+    def tick_dj_badge(self):
+        """Every second: "🎵 DJ (2)" on the main window while song requests wait for approval"""
+        count = len(self.dj.pending) if self.dj else 0
+        text = f"🎵 DJ ({count})" if count else "🎵 DJ"
+        if self.dj_btn.cget('text') != text:
+            self.dj_btn.config(text=text)
+        self.root.after(1000, self.tick_dj_badge)
+
     def open_soundboard_window(self):
         """🔊 Sounds button"""
         if not self.soundboard:
@@ -691,10 +744,7 @@ class TTSReplicaWASAPI:
         """DJ "now playing" through the TTS - only while the TTS is started (nothing else empties the queue)"""
         if not self.is_running:
             return
-        voice = self.config.get('dj', {}).get('announce_voice', 'Default')
-        if not voice or voice == 'Default':
-            voice = self.config.get('announcement_voice', '')
-        self.message_queue.put({'text': text, 'voice': voice, 'username': '__announcement__'})
+        self.message_queue.put({'text': text, 'voice': self.dj_voice(), 'username': '__announcement__'})
 
     def cleanup_leftover_temp(self):
         """Old unpack folders and stray DECtalk WAVs from earlier runs"""
@@ -812,7 +862,7 @@ class TTSReplicaWASAPI:
         prefix_var = tk.StringVar(value=game.get('tts_command_prefix', '!tts'))
         ttk.Entry(frame, textvariable=prefix_var, width=15).grid(row=3, column=1, sticky=tk.W, pady=4)
 
-        ttk.Label(frame, foreground='gray', justify=tk.LEFT, text=(
+        ttk.Label(frame, style='Hint.TLabel', justify=tk.LEFT, text=(
             "Source games: add  con_logfile log.txt  to that game's autoexec.cfg (in its cfg folder),\n"
             "then pick the log.txt it creates in the game's mod folder, e.g. ...\\left4dead2\\log.txt.\n"
             + ("" if editing else "A new game starts with this game's admins and an empty blocked list.")
@@ -942,9 +992,9 @@ class TTSReplicaWASAPI:
         # Create export dialog
         export_dialog = tk.Toplevel(self.root)
         export_dialog.title("Export Configuration")
-        export_dialog.geometry("400x300")
+        ui_theme.size_window(export_dialog, 400, 300, self.root)
         
-        ttk.Label(export_dialog, text="Select sections to export:", font=('Arial', 10, 'bold')).pack(pady=10)
+        ttk.Label(export_dialog, text="Select sections to export:", style='Section.TLabel').pack(pady=10)
         
         # Checkboxes for sections
         export_options = {}
@@ -963,7 +1013,9 @@ class TTSReplicaWASAPI:
         section_keys = {
             'games': ['games', 'current_game', 'admins', 'blocked', 'log_path'],
             'voices': ['default_voice', 'hidden_voices', 'dectalk_profiles', 'dectalk_volume', 'dectalk_enabled',
-                       'random_voice_enabled', 'random_voice_exclusions', 'voice_toggle_command'],
+                       'random_voice_enabled', 'random_voice_exclusions', 'voice_toggle_command',
+                       'textaloud_enabled', 'textaloud_volume', 'textaloud_voices', 'textaloud_idle_minutes',
+                       'piper_volume'],
             'voice_commands': ['voice_commands'],
             'user_voices': ['user_voice_preferences'],
             'announcements': ['announcements', 'announcement_enabled', 'announcement_voice'],
@@ -1154,6 +1206,7 @@ class TTSReplicaWASAPI:
         if hasattr(self, 'spam_mute_var'):
             self.spam_mute_var.set(self.config.get('spam_mute_enabled', True))
             self.mute_minutes_var.set(str(self.config.get('mute_minutes', 10)))
+            self.spam_repeat_var.set(str(self.config.get('spam_repeat_count', 3)))
             self.refresh_muted_list()
         # Auto-block words and announcement fields always show the new config (load_settings skips an
         # empty keyword list), so a later Save can't write the old values back
@@ -1176,6 +1229,15 @@ class TTSReplicaWASAPI:
         self.dectalk_volume = float(self.config.get('dectalk_volume', 0.7))
         if hasattr(self, 'dectalk_volume_var'):
             self.dectalk_volume_var.set(self.dectalk_volume)
+        self.textaloud_enabled = bool(self.config.get('textaloud_enabled', True))
+        self.textaloud_volume = float(self.config.get('textaloud_volume', 1.0))
+        if getattr(self, 'textaloud', None):
+            self.textaloud.idle_minutes = float(self.config.get('textaloud_idle_minutes', 10))
+        if hasattr(self, 'textaloud_enabled_var'):
+            self.textaloud_enabled_var.set(self.textaloud_enabled)
+            self.textaloud_volume_var.set(self.textaloud_volume)
+            self.textaloud_idle_var.set(f"{float(self.config.get('textaloud_idle_minutes', 10)):g}")
+            self.refresh_textaloud_lists()
         if hasattr(self, 'tts_prefix_entry'):
             self.tts_prefix_entry.delete(0, tk.END)
             self.tts_prefix_entry.insert(0, self.get_current_game_config().get('tts_command_prefix', '!tts'))
@@ -1200,12 +1262,12 @@ class TTSReplicaWASAPI:
         """Open dialog to configure random voice exclusions"""
         dialog = tk.Toplevel(self.root)
         dialog.title("Random Voice Exclusions")
-        dialog.geometry("400x500")
+        ui_theme.size_window(dialog, 400, 500, self.root)
         dialog.transient(self.root)
         dialog.grab_set()
         
         ttk.Label(dialog, text="Select voices to EXCLUDE from random assignment:", 
-                 font=('Arial', 10, 'bold')).pack(pady=10)
+                 style='Section.TLabel').pack(pady=10)
         ttk.Label(dialog, text="(Checked voices will NOT be assigned to new users)").pack()
         
         # Buttons FIRST (at bottom, but pack before canvas so they get space)
@@ -1250,7 +1312,8 @@ class TTSReplicaWASAPI:
         if hasattr(self, 'dectalk_profiles'):
             for profile_name in self.dectalk_profiles.keys():
                 all_voices.add(f"[DECtalk] {profile_name}")
-        
+        all_voices.update(self.extra_voice_names())
+
         # Create checkboxes for each voice
         for voice_name in sorted(all_voices):
             var = tk.BooleanVar(value=voice_name in self.random_voice_exclusions)
@@ -1279,7 +1342,8 @@ class TTSReplicaWASAPI:
                 dectalk_voice = f"[DECtalk] {profile_name}"
                 if dectalk_voice not in self.random_voice_exclusions:
                     available_voices.append(dectalk_voice)
-        
+        available_voices += [v for v in self.extra_voice_names() if v not in self.random_voice_exclusions]
+
         if not available_voices:
             logger.warning("No voices available for random assignment (all excluded?)")
             return None
@@ -1299,208 +1363,283 @@ class TTSReplicaWASAPI:
         logger.info(f"Assigned random voice to new user {username}: {chosen_voice}")
         return chosen_voice
             
+    def px(self, n):
+        """Pixels at 100% Windows scaling -> pixels on this screen"""
+        return int(round(n * getattr(self, 'ui_scale', 1.0)))
+
     def setup_gui(self):
-        """Setup GUI with enhanced audio device selection"""
+        """Main window. Every part can shrink: the chat log, the speak box and the tabs share the height (drag the
+        dividers to change the split), the lists on the right share theirs, and a tab that doesn't fit scrolls
+        instead of being cut off. Size, position and divider positions are remembered."""
+        ui_theme.enable_dpi_awareness()
         self.root = tk.Tk()
         self.root.title("TTS_GUI - WASAPI Enhanced")
-        self.root.geometry("1100x1250")
-        self.root.minsize(1100, 1100)  # Set minimum size to prevent resize issues
-        
-        # Style
-        style = ttk.Style()
-        style.theme_use('default')
-        
-        # Top frame with chat display and controls
-        top_frame = ttk.Frame(self.root)
-        top_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        # Left side - chat display
-        left_frame = ttk.Frame(top_frame)
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        # Control buttons
+        ui_theme.apply_forced_scale(self.root)
+        self.ui_scale = ui_theme.scale_of(self.root)
+        self.ui_mode = ui_theme.apply_theme(self.root, self.config.get('ui_theme', 'system'))
+        self.restore_window_size()
+        px = self.px
+
+        # Left: the main area in resizable sections | right: the lists (drag the divider to widen them)
+        self.side_paned = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, sashwidth=px(6), bd=0,
+                                         sashrelief=tk.FLAT, opaqueresize=True)
+        self.side_paned.pack(fill=tk.BOTH, expand=True, padx=px(6), pady=px(6))
+        self.main_paned = tk.PanedWindow(self.side_paned, orient=tk.VERTICAL, sashwidth=px(6), bd=0,
+                                         sashrelief=tk.FLAT, opaqueresize=True)
+        right_frame = ttk.Frame(self.side_paned)
+        self.side_paned.add(self.main_paned, stretch='always', minsize=px(540))
+        self.side_paned.add(right_frame, stretch='never', minsize=px(240))
+
+        # Chat log, with the control buttons above it
+        left_frame = ttk.Frame(self.main_paned)
         button_frame = ttk.Frame(left_frame)
-        button_frame.pack(fill=tk.X, pady=5)
-        
-        self.start_btn = ttk.Button(button_frame, text="Start TTS", command=self.start_tts)
-        self.start_btn.pack(side=tk.LEFT, padx=2)
-        
+        button_frame.pack(fill=tk.X, pady=(0, px(4)))
+
+        self.start_btn = ttk.Button(button_frame, text="Start TTS", command=self.start_tts, style='Accent.TButton')
+        self.start_btn.pack(side=tk.LEFT, padx=(0, px(4)))
+
         self.stop_btn = ttk.Button(button_frame, text="Stop TTS", command=self.stop_tts, state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.LEFT, padx=2)
-        
+        self.stop_btn.pack(side=tk.LEFT, padx=(0, px(4)))
+
         self.reload_btn = ttk.Button(button_frame, text="Reload TTS", command=self.reload_tts)
-        self.reload_btn.pack(side=tk.LEFT, padx=2)
-        
+        self.reload_btn.pack(side=tk.LEFT, padx=(0, px(4)))
+
         self.dj_btn = ttk.Button(button_frame, text="🎵 DJ", command=self.open_dj_window)
-        self.dj_btn.pack(side=tk.LEFT, padx=2)
+        self.dj_btn.pack(side=tk.LEFT, padx=(0, px(4)))
 
         self.soundboard_btn = ttk.Button(button_frame, text="🔊 Sounds", command=self.open_soundboard_window)
-        self.soundboard_btn.pack(side=tk.LEFT, padx=2)
-        
-        # Chat display
-        self.chat_display = scrolledtext.ScrolledText(left_frame, height=15, width=50)
+        self.soundboard_btn.pack(side=tk.LEFT, padx=(0, px(4)))
+
+        self.chat_display = ui_theme.ScrolledText(left_frame, height=6, width=50)
         self.chat_display.pack(fill=tk.BOTH, expand=True)
-        
-        # Right side - Admin and Blocked lists
-        right_frame = ttk.Frame(top_frame)
-        right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5)
-        
-        # ADMINS section
-        admin_label = ttk.Label(right_frame, text="ADMINS", font=('Arial', 10, 'bold'))
-        admin_label.pack()
-        
-        self.admin_listbox = tk.Listbox(right_frame, height=8, width=30)
-        self.admin_listbox.pack(pady=5)
-        
-        admin_btn_frame = ttk.Frame(right_frame)
-        admin_btn_frame.pack()
-        
-        ttk.Button(admin_btn_frame, text="✓ Save", command=self.save_admins).pack(side=tk.LEFT, padx=2)
-        ttk.Button(admin_btn_frame, text="✖ Remove", command=self.remove_admin).pack(side=tk.LEFT, padx=2)
-        ttk.Button(admin_btn_frame, text="+ Add", command=self.add_admin).pack(side=tk.LEFT, padx=2)
-        
-        # BLOCKED section
-        blocked_label = ttk.Label(right_frame, text="BLOCKED", font=('Arial', 10, 'bold'))
-        blocked_label.pack(pady=(10, 0))
-        
-        self.blocked_listbox = tk.Listbox(right_frame, height=8, width=30)
-        self.blocked_listbox.pack(pady=5)
-        
-        blocked_btn_frame = ttk.Frame(right_frame)
-        blocked_btn_frame.pack()
-        
-        ttk.Button(blocked_btn_frame, text="✓ Save", command=self.save_blocked).pack(side=tk.LEFT, padx=2)
-        ttk.Button(blocked_btn_frame, text="✖ Remove", command=self.remove_blocked).pack(side=tk.LEFT, padx=2)
-        ttk.Button(blocked_btn_frame, text="+ Add", command=self.add_blocked).pack(side=tk.LEFT, padx=2)
+        self.main_paned.add(left_frame, stretch='always', minsize=px(110))
+
+        # Right side - the lists share the height and scroll
+        right_frame.columnconfigure(0, weight=1)
+        self.admin_listbox, row = self.side_list(right_frame, 0, "ADMINS", [
+            ("✓ Save", self.save_admins), ("✖ Remove", self.remove_admin), ("+ Add", self.add_admin)], weight=1)
+        self.blocked_listbox, row = self.side_list(right_frame, row, "BLOCKED", [
+            ("✓ Save", self.save_blocked), ("✖ Remove", self.remove_blocked), ("+ Add", self.add_blocked)], weight=2)
 
         # MUTED section - temporary mutes from !mute, the spam guard, or + Mute here
-        muted_label = ttk.Label(right_frame, text="MUTED", font=('Arial', 10, 'bold'))
-        muted_label.pack(pady=(10, 0))
-
-        self.muted_listbox = tk.Listbox(right_frame, height=4, width=30)
-        self.muted_listbox.pack(pady=5)
+        self.muted_listbox, row = self.side_list(right_frame, row, "MUTED", [
+            ("✖ Unmute", self.unmute_selected), ("+ Mute", self.add_mute)], weight=1)
         self.muted_listbox_names = []  # usernames in the same order as the listbox rows
 
-        muted_btn_frame = ttk.Frame(right_frame)
-        muted_btn_frame.pack()
-
-        ttk.Button(muted_btn_frame, text="✖ Unmute", command=self.unmute_selected).pack(side=tk.LEFT, padx=2)
-        ttk.Button(muted_btn_frame, text="+ Mute", command=self.add_mute).pack(side=tk.LEFT, padx=2)
-
         mute_opts_frame = ttk.Frame(right_frame)
-        mute_opts_frame.pack(pady=(3, 0))
+        mute_opts_frame.grid(row=row, column=0, sticky='w', pady=(px(4), 0))
         self.spam_mute_var = tk.BooleanVar(value=self.config.get('spam_mute_enabled', True))
         ttk.Checkbutton(mute_opts_frame, text="Auto-mute spam", variable=self.spam_mute_var,
                         command=self.save_mute_settings).pack(side=tk.LEFT)
-        ttk.Label(mute_opts_frame, text="Mute for").pack(side=tk.LEFT, padx=(8, 2))
+        mute_for_frame = ttk.Frame(right_frame)
+        mute_for_frame.grid(row=row + 1, column=0, sticky='w', pady=(px(2), 0))
+        ttk.Label(mute_for_frame, text="Mute for").pack(side=tk.LEFT, padx=(0, px(4)))
         self.mute_minutes_var = tk.StringVar(value=str(self.config.get('mute_minutes', 10)))
-        mute_minutes_box = ttk.Spinbox(mute_opts_frame, from_=1, to=1440, width=5,
+        mute_minutes_box = ttk.Spinbox(mute_for_frame, from_=1, to=1440, width=4,
                                        textvariable=self.mute_minutes_var, command=self.save_mute_settings)
         mute_minutes_box.pack(side=tk.LEFT)
         mute_minutes_box.bind('<FocusOut>', lambda e: self.save_mute_settings())
-        ttk.Label(mute_opts_frame, text="min").pack(side=tk.LEFT, padx=2)
+        ttk.Label(mute_for_frame, text="min").pack(side=tk.LEFT, padx=px(4))
+
+        spam_opts_frame = ttk.Frame(right_frame)
+        spam_opts_frame.grid(row=row + 3, column=0, sticky='w', pady=(px(2), 0))
+        ttk.Label(right_frame, text="Spam = the same message").grid(row=row + 2, column=0, sticky='w', pady=(px(4), 0))
+        self.spam_repeat_var = tk.StringVar(value=str(self.config.get('spam_repeat_count', 3)))
+        spam_repeat_box = ttk.Spinbox(spam_opts_frame, from_=2, to=10, width=3,
+                                      textvariable=self.spam_repeat_var, command=self.save_mute_settings)
+        spam_repeat_box.pack(side=tk.LEFT, padx=(0, px(4)))
+        spam_repeat_box.bind('<FocusOut>', lambda e: self.save_mute_settings())
+        ttk.Label(spam_opts_frame, text="times in 30 s").pack(side=tk.LEFT)
 
         # USER VOICE PREFERENCES section
-        user_voices_label = ttk.Label(right_frame, text="USER VOICES", font=('Arial', 10, 'bold'))
-        user_voices_label.pack(pady=(10, 0))
-        
-        self.user_voices_listbox = tk.Listbox(right_frame, height=8, width=30)
-        self.user_voices_listbox.pack(pady=5)
-        
-        user_voices_btn_frame = ttk.Frame(right_frame)
-        user_voices_btn_frame.pack()
-        
-        ttk.Button(user_voices_btn_frame, text="✓ Save", command=self.save_user_voices).pack(side=tk.LEFT, padx=2)
-        ttk.Button(user_voices_btn_frame, text="✖ Remove", command=self.remove_user_voice).pack(side=tk.LEFT, padx=2)
-        ttk.Button(user_voices_btn_frame, text="+ Add", command=self.add_user_voice).pack(side=tk.LEFT, padx=2)
-        ttk.Button(user_voices_btn_frame, text="✎ Edit", command=self.edit_user_voice).pack(side=tk.LEFT, padx=2)
-        
-        # Long-form text input section (for DECtalk singing and long messages)
-        # Use PanedWindow for resizable long-form text
-        longform_paned = tk.PanedWindow(self.root, orient=tk.VERTICAL, sashwidth=5, sashrelief=tk.RAISED)
-        longform_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        longform_frame = ttk.LabelFrame(longform_paned, text="Long-form Text Input (DECtalk Singing/Long Messages)")
-        
-        # Text input area with resizable height
+        self.user_voices_listbox, row = self.side_list(right_frame, row + 4, "USER VOICES", [
+            ("✓ Save", self.save_user_voices), ("✖ Remove", self.remove_user_voice),
+            ("+ Add", self.add_user_voice), ("✎ Edit", self.edit_user_voice)], weight=2)
+
+        # Speak section: long-form text (DECtalk singing and long messages) and Quick Speak
+        speak_frame = self.speak_frame = ttk.Frame(self.main_paned)
+        longform_frame = ttk.LabelFrame(speak_frame, text="Long-form Text Input (DECtalk Singing/Long Messages)",
+                                        padding=(px(6), px(2), px(6), px(6)))
+        longform_frame.pack(fill=tk.BOTH, expand=True)
+
         text_input_frame = ttk.Frame(longform_frame)
-        text_input_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        
-        self.longform_text = scrolledtext.ScrolledText(text_input_frame, height=4, width=80, wrap=tk.WORD)
+        text_input_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.longform_text = ui_theme.ScrolledText(text_input_frame, height=3, width=60, wrap=tk.WORD)
         self.longform_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
+
         # Add character counter
         char_count_frame = ttk.Frame(text_input_frame)
-        char_count_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5)
-        
-        self.char_count_label = ttk.Label(char_count_frame, text="0 chars")
+        char_count_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(px(6), 0))
+
+        self.char_count_label = ttk.Label(char_count_frame, text="0 chars", style='Hint.TLabel')
         self.char_count_label.pack()
-        
+
         # Update character count on text change
         def update_char_count(event=None):
             text = self.longform_text.get("1.0", tk.END).strip()
             self.char_count_label.config(text=f"{len(text)} chars")
-        
+
         self.longform_text.bind("<KeyRelease>", update_char_count)
-        
-        longform_paned.add(longform_frame, minsize=100)
-        
+
         # Controls for long-form text
         longform_controls = ttk.Frame(longform_frame)
-        longform_controls.pack(fill=tk.X, padx=5, pady=2)
-        
-        # Voice selector for long-form text
-        ttk.Label(longform_controls, text="Voice:").pack(side=tk.LEFT, padx=2)
-        self.longform_voice_var = tk.StringVar(value="Default")
-        self.longform_voice_combo = ttk.Combobox(longform_controls, textvariable=self.longform_voice_var, 
-                                                 width=30, state='readonly')
-        self.longform_voice_combo.pack(side=tk.LEFT, padx=2)
-        
-        ttk.Button(longform_controls, text="Speak Long Text", command=self.speak_longform).pack(side=tk.LEFT, padx=5)
-        ttk.Button(longform_controls, text="Clear", command=lambda: self.longform_text.delete("1.0", tk.END)).pack(side=tk.LEFT, padx=2)
+        longform_controls.pack(fill=tk.X, pady=(px(6), 0))
 
-        # Quick Speak/Apply controls - placed between longform and tabs
-        quick_speak_frame = ttk.Frame(longform_paned)
-        
-        test_frame = ttk.Frame(quick_speak_frame)
-        test_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        ttk.Label(test_frame, text="Quick Speak:").pack(side=tk.LEFT, padx=5)
-        self.test_entry = ttk.Entry(test_frame, width=60)
-        self.test_entry.pack(side=tk.LEFT, padx=5)
+        # Voice selector for long-form text
+        ttk.Label(longform_controls, text="Voice:").pack(side=tk.LEFT, padx=(0, px(4)))
+        self.longform_voice_var = tk.StringVar(value="Default")
+        self.longform_voice_combo = ttk.Combobox(longform_controls, textvariable=self.longform_voice_var,
+                                                 width=30, state='readonly')
+        self.longform_voice_combo.pack(side=tk.LEFT, padx=(0, px(6)))
+
+        ttk.Button(longform_controls, text="Speak Long Text", command=self.speak_longform).pack(side=tk.LEFT, padx=(0, px(4)))
+        ttk.Button(longform_controls, text="Clear", command=lambda: self.longform_text.delete("1.0", tk.END)).pack(side=tk.LEFT)
+
+        # Quick Speak/Apply controls - between long-form and the tabs
+        test_frame = ttk.Frame(speak_frame)
+        test_frame.pack(fill=tk.X, pady=(px(6), 0))
+
+        ttk.Button(test_frame, text="✓ Apply", command=self.apply_settings).pack(side=tk.RIGHT)
+        ttk.Button(test_frame, text="Speak", command=self.speak_test).pack(side=tk.RIGHT, padx=(0, px(4)))
+        ttk.Label(test_frame, text="Quick Speak:").pack(side=tk.LEFT, padx=(0, px(4)))
+        self.test_entry = ttk.Entry(test_frame, width=20)
+        self.test_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, px(6)))
         self.test_entry.insert(0, "Enter your text here")
-        
-        ttk.Button(test_frame, text="Speak", command=self.speak_test).pack(side=tk.LEFT, padx=2)
-        ttk.Button(test_frame, text="✓ Apply", command=self.apply_settings).pack(side=tk.LEFT, padx=2)
-        
-        longform_paned.add(quick_speak_frame, minsize=50)
-        
-        # Bottom section - Tabs
-        self.notebook = ttk.Notebook(longform_paned)
-        longform_paned.add(self.notebook, minsize=250)
-        
+
+        self.main_paned.add(speak_frame, stretch='never', minsize=px(150))
+
+        # Bottom section - Tabs (each scrolls if the window is too small for it)
+        self.notebook = ttk.Notebook(self.main_paned)
+        self.main_paned.add(self.notebook, stretch='always', minsize=px(170))
+
         # Create tabs
         self.create_settings_tab()
         self.create_audio_devices_tab()
         self.create_voice_commands_tab()
         self.create_dectalk_tab()
+        if self.textaloud and textaloud_installed():  # only on PCs that have TextAloud - nobody else needs it
+            self.create_textaloud_tab()
+        if VOICES_AVAILABLE:
+            self.create_voices_tab()
         self.create_announcements_tab()
         self.create_auto_block_tab()
         self.create_help_tab()
         self.create_testing_tab()
-        
-        
+
+        ui_theme.apply_theme(self.root, self.config.get('ui_theme', 'system'))  # colour everything just built
+        self.root.after(300, self.restore_dividers)  # once the window has its final size
+
+    def side_list(self, parent, row, title, buttons, weight=1):
+        """One list on the right: title, the list (shares the height with the others, scrolls) and its buttons.
+        Returns (listbox, next free grid row)."""
+        px = self.px
+        ttk.Label(parent, text=title, style='Section.TLabel').grid(row=row, column=0, sticky='w',
+                                                                   pady=(px(10) if row else 0, px(3)))
+        box = ttk.Frame(parent)
+        box.grid(row=row + 1, column=0, sticky='nsew')
+        parent.rowconfigure(row + 1, weight=weight, minsize=px(44))
+        listbox = tk.Listbox(box, height=3, width=26)
+        bar = ttk.Scrollbar(box, orient=tk.VERTICAL, command=listbox.yview)
+        listbox.configure(yscrollcommand=bar.set)
+        bar.pack(side=tk.RIGHT, fill=tk.Y)
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        btns = ttk.Frame(parent)
+        btns.grid(row=row + 2, column=0, sticky='w', pady=(px(4), 0))
+        for text, command in buttons:
+            ttk.Button(btns, text=text, command=command, style='Compact.TButton').pack(side=tk.LEFT, padx=(0, px(3)))
+        return listbox, row + 3
+
+    def add_tab(self, title):
+        """A notebook tab whose contents scroll when the window is too small for them"""
+        holder = ui_theme.ScrollFrame(self.notebook)
+        self.notebook.add(holder, text=title)
+        return holder.inner
+
+    def restore_window_size(self):
+        """Last size and position (if it's still on a screen), else a size that fits this screen"""
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        self.root.minsize(min(self.px(1100), sw - 40), min(self.px(600), sh - 80))
+        saved = self.config.get('window') or {}
+        geometry = saved.get('geometry', '')
+        match = re.match(r'^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$', geometry)
+        on_screen = False
+        if match:
+            w, h, x, y = map(int, match.groups())
+            try:  # the whole desktop, across all monitors
+                import ctypes
+                gm = ctypes.windll.user32.GetSystemMetrics
+                vx, vy, vw, vh = gm(76), gm(77), gm(78), gm(79)
+            except Exception:
+                vx, vy, vw, vh = 0, 0, sw, sh
+            on_screen = (w >= 400 and h >= 300 and vx - 50 <= x <= vx + vw - 200 and vy - 10 <= y <= vy + vh - 100)
+        if on_screen:
+            self.root.geometry(geometry)
+        else:
+            ui_theme.size_window(self.root, 1260, 1100)
+        if saved.get('zoomed'):
+            self.root.after_idle(lambda: self.root.state('zoomed'))
+
+    def fit_speak_pane(self):
+        """Keep the long-form / Quick Speak section tall enough for its controls - the looks differ in height, so
+        after switching look (or with dividers saved under another look) it would otherwise be cut off"""
+        try:
+            self.root.update_idletasks()
+            need = self.speak_frame.winfo_reqheight()
+            self.main_paned.paneconfigure(self.speak_frame, minsize=need)
+            short = need - self.speak_frame.winfo_height()
+            if short > 0:
+                self.main_paned.sash_place(1, 0, self.main_paned.sash_coord(1)[1] + short)
+        except (tk.TclError, AttributeError):
+            pass
+
+    def restore_dividers(self):
+        saved = self.config.get('window') or {}
+        try:
+            self.root.update_idletasks()
+            for i, y in enumerate(saved.get('dividers', [])[:2]):
+                self.main_paned.sash_place(i, 0, int(y))
+            if saved.get('side_divider'):
+                self.side_paned.sash_place(0, int(saved['side_divider']), 0)
+        except (tk.TclError, ValueError, TypeError):
+            pass
+        self.fit_speak_pane()
+
+    def remember_window_size(self):
+        """on_closing: keep size, position, maximized and the divider positions for next time"""
+        try:
+            saved = dict(self.config.get('window') or {})
+            zoomed = self.root.state() == 'zoomed'
+            saved['zoomed'] = zoomed
+            if not zoomed:
+                saved['geometry'] = self.root.geometry()
+            saved['dividers'] = [self.main_paned.sash_coord(i)[1] for i in range(2)]
+            saved['side_divider'] = self.side_paned.sash_coord(0)[0]
+            self.config['window'] = saved
+        except Exception as e:
+            logger.debug(f"Could not remember the window size: {e}")
+
+    def on_theme_changed(self, event=None):
+        choice = {'Match Windows': 'system', 'Light': 'light', 'Dark': 'dark',
+                  'Classic (original look)': 'classic'}.get(self.theme_var.get(), 'system')
+        self.config['ui_theme'] = choice
+        self.save_config()
+        self.ui_mode = ui_theme.apply_theme(self.root, choice)
+        self.root.after(150, self.fit_speak_pane)  # after the new look has settled
+        if hasattr(self, 'device_tree'):
+            self.device_tree.tag_configure('default', background=ui_theme.colors()['good'])
+
     def create_settings_tab(self):
         """Settings tab with config import/export"""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Settings")
+        tab = self.add_tab("Settings")
         settings_frame = ttk.Frame(tab)
         settings_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        settings_frame.columnconfigure(1, weight=1)
         
         # Game selection (games are added/edited/removed with the buttons next to it)
         ttk.Label(settings_frame, text="Game").grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
-        self.game_combo = ttk.Combobox(settings_frame, values=self.game_names(), width=50, state='readonly')
-        self.game_combo.grid(row=0, column=1, padx=10, pady=5)
+        self.game_combo = ttk.Combobox(settings_frame, values=self.game_names(), width=28, state='readonly')
+        self.game_combo.grid(row=0, column=1, sticky='ew', padx=10, pady=5)
         self.game_combo.set(self.current_game)
         self.game_combo.bind('<<ComboboxSelected>>', self.on_game_changed)
         game_btn_frame = ttk.Frame(settings_frame)
@@ -1511,20 +1650,20 @@ class TTSReplicaWASAPI:
         
         # TTS Command Prefix - moved from Voice Commands to Settings
         ttk.Label(settings_frame, text="TTS Command Prefix").grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
-        self.tts_prefix_entry = ttk.Entry(settings_frame, width=50)
-        self.tts_prefix_entry.grid(row=1, column=1, padx=10, pady=5)
+        self.tts_prefix_entry = ttk.Entry(settings_frame, width=14)
+        self.tts_prefix_entry.grid(row=1, column=1, sticky='w', padx=10, pady=5)
         self.tts_prefix_entry.insert(0, self.get_current_game_config().get('tts_command_prefix', '!tts'))
-        ttk.Label(settings_frame, text="Command users type in game chat (e.g., !tts, !speak). DRG strips first !tts.").grid(row=1, column=2, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(settings_frame, text="Command users type in game chat (e.g., !tts, !speak). DRG strips first !tts.", wraplength=280, style='Hint.TLabel').grid(row=1, column=2, sticky=tk.W, padx=5, pady=5)
         
         # Game Log File
         ttk.Label(settings_frame, text="Game Log File").grid(row=2, column=0, sticky=tk.W, padx=10, pady=5)
         self.log_path_var = tk.StringVar()
-        ttk.Entry(settings_frame, textvariable=self.log_path_var, width=50).grid(row=2, column=1, padx=10, pady=5)
+        ttk.Entry(settings_frame, textvariable=self.log_path_var, width=28).grid(row=2, column=1, columnspan=2, sticky='ew', padx=10, pady=5)
         
         # Admin Username
         ttk.Label(settings_frame, text="Admin Username").grid(row=3, column=0, sticky=tk.W, padx=10, pady=5)
         self.admin_username_var = tk.StringVar()
-        ttk.Entry(settings_frame, textvariable=self.admin_username_var, width=50).grid(row=3, column=1, padx=10, pady=5)
+        ttk.Entry(settings_frame, textvariable=self.admin_username_var, width=28).grid(row=3, column=1, sticky='w', padx=10, pady=5)
         
         # Private Mode
         ttk.Label(settings_frame, text="Private Mode").grid(row=4, column=0, sticky=tk.W, padx=10, pady=5)
@@ -1548,8 +1687,8 @@ class TTSReplicaWASAPI:
         
         # Default Voice
         ttk.Label(settings_frame, text="Default Voice").grid(row=7, column=0, sticky=tk.W, padx=10, pady=5)
-        self.default_voice_combo = ttk.Combobox(settings_frame, width=50)
-        self.default_voice_combo.grid(row=7, column=1, padx=10, pady=5)
+        self.default_voice_combo = ttk.Combobox(settings_frame, width=28)
+        self.default_voice_combo.grid(row=7, column=1, sticky='ew', padx=10, pady=5)
         
         # DECtalk Voice Volume
         ttk.Label(settings_frame, text="DECtalk Voice Volume").grid(row=8, column=0, sticky=tk.W, padx=10, pady=5)
@@ -1559,7 +1698,17 @@ class TTSReplicaWASAPI:
         
         # Config Import/Export buttons
         config_frame = ttk.LabelFrame(settings_frame, text="Configuration Management")
-        config_frame.grid(row=9, column=0, columnspan=3, sticky=tk.W+tk.E, padx=10, pady=10)
+        config_frame.grid(row=10, column=0, columnspan=3, sticky=tk.W+tk.E, padx=10, pady=10)
+
+        # Appearance: Windows 11 style, light / dark / follow Windows
+        ttk.Label(settings_frame, text="Appearance").grid(row=9, column=0, sticky=tk.W, padx=10, pady=5)
+        self.theme_var = tk.StringVar(value={'system': 'Match Windows', 'light': 'Light', 'dark': 'Dark',
+                                             'classic': 'Classic (original look)'}.get(
+            self.config.get('ui_theme', 'system'), 'Match Windows'))
+        theme_combo = ttk.Combobox(settings_frame, textvariable=self.theme_var, state='readonly', width=22,
+                                   values=['Match Windows', 'Light', 'Dark', 'Classic (original look)'])
+        theme_combo.grid(row=9, column=1, sticky=tk.W, padx=10, pady=5)
+        theme_combo.bind('<<ComboboxSelected>>', self.on_theme_changed)
         
         ttk.Button(config_frame, text="Export Config", command=self.export_config).pack(side=tk.LEFT, padx=5, pady=5)
         ttk.Button(config_frame, text="Import Config", command=self.import_config).pack(side=tk.LEFT, padx=5, pady=5)
@@ -1567,7 +1716,7 @@ class TTSReplicaWASAPI:
         # Up to 150%: DECtalk's own output peaks around 77% of full scale, so the very loudest bits may clip past ~130%
         self.dectalk_volume_slider = ttk.Scale(dectalk_volume_frame, from_=0.0, to=1.5,
                                                variable=self.dectalk_volume_var, 
-                                               orient=tk.HORIZONTAL, length=300)
+                                               orient=tk.HORIZONTAL, length=self.px(240))
         self.dectalk_volume_slider.pack(side=tk.LEFT)
         self.dectalk_volume_label = ttk.Label(dectalk_volume_frame, text=f"{int(self.dectalk_volume_var.get() * 100)}%")
         self.dectalk_volume_label.pack(side=tk.LEFT, padx=10)
@@ -1579,11 +1728,10 @@ class TTSReplicaWASAPI:
             
     def create_audio_devices_tab(self):
         """Audio Devices tab with real Windows devices"""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Audio Devices")
+        tab = self.add_tab("Audio Devices")
         
         # Description
-        desc_label = ttk.Label(tab, text="Select audio output device for TTS:", font=('Arial', 10))
+        desc_label = ttk.Label(tab, text="Select audio output device for TTS:")
         desc_label.pack(pady=10)
         
         # Device list frame
@@ -1626,7 +1774,7 @@ class TTSReplicaWASAPI:
                 ), tags=('default',) if device.get('is_default', False) else ())
             
         # Highlight default device
-        self.device_tree.tag_configure('default', background='lightgreen')
+        self.device_tree.tag_configure('default', background=ui_theme.colors()['good'])
         
         self.device_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
@@ -1643,13 +1791,12 @@ class TTSReplicaWASAPI:
         ttk.Button(btn_frame, text="Refresh Devices", command=self.refresh_audio_devices).pack(side=tk.LEFT, padx=5)
         
         # Current device label
-        self.current_device_label = ttk.Label(tab, text="Current Device: Default", font=('Arial', 10, 'bold'))
+        self.current_device_label = ttk.Label(tab, text="Current Device: Default", style='Section.TLabel')
         self.current_device_label.pack(pady=10)
         
     def create_voice_commands_tab(self):
         """Voice Commands tab - editable"""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Voice Commands")
+        tab = self.add_tab("Voice Commands")
         
         # Create two paned sections
         paned = ttk.PanedWindow(tab, orient=tk.HORIZONTAL)
@@ -1702,9 +1849,11 @@ class TTSReplicaWASAPI:
         ttk.Button(btn_frame, text="Add Command", command=self.add_voice_command).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Edit Command", command=self.edit_voice_command_full).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Remove Command", command=self.remove_voice_command).pack(side=tk.LEFT, padx=2)
-        ttk.Separator(btn_frame, orient='vertical').pack(side=tk.LEFT, padx=5, fill='y')
-        ttk.Button(btn_frame, text="Save Commands", command=self.save_voice_commands).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Reset to Defaults", command=self.reset_voice_commands).pack(side=tk.LEFT, padx=2)
+        # second row, so the buttons fit beside the voice list
+        btn_frame2 = ttk.Frame(left_frame)
+        btn_frame2.pack(pady=(0, 5))
+        ttk.Button(btn_frame2, text="Save Commands", command=self.save_voice_commands).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame2, text="Reset to Defaults", command=self.reset_voice_commands).pack(side=tk.LEFT, padx=2)
         
         # Right side - Voice Management
         right_frame = ttk.Frame(paned)
@@ -1765,8 +1914,7 @@ class TTSReplicaWASAPI:
     
     def create_dectalk_tab(self):
         """DECtalk extended voices tab"""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="DECtalk")
+        tab = self.add_tab("DECtalk")
         
         # Enable/Disable DECtalk
         enable_frame = ttk.Frame(tab)
@@ -1816,8 +1964,8 @@ class TTSReplicaWASAPI:
         code_entry = ttk.Entry(right_frame, textvariable=self.dectalk_profile_code_var, width=30)
         code_entry.pack(fill=tk.X, pady=(0, 10))
         
-        ttk.Label(right_frame, text="Example: [:np] for Paul, [:nb] for Betty", font=('Arial', 8)).pack(anchor=tk.W)
-        ttk.Label(right_frame, text="Advanced: [:np][:rate 200][:pitch 150]", font=('Arial', 8)).pack(anchor=tk.W)
+        ttk.Label(right_frame, text="Example: [:np] for Paul, [:nb] for Betty", style='Hint.TLabel').pack(anchor=tk.W)
+        ttk.Label(right_frame, text="Advanced: [:np][:rate 200][:pitch 150]", style='Hint.TLabel').pack(anchor=tk.W)
         
         # Profile buttons
         btn_frame = ttk.Frame(right_frame)
@@ -1853,61 +2001,422 @@ class TTSReplicaWASAPI:
     
     def create_auto_block_tab(self):
         """Auto Block tab"""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Auto Block")
+        tab = self.add_tab("Auto Block")
         
         ttk.Label(tab, text="Auto-block keywords (one per line):").pack(pady=10)
         
-        self.auto_block_text = scrolledtext.ScrolledText(tab, height=10, width=60)
+        self.auto_block_text = ui_theme.ScrolledText(tab, height=10, width=60)
         self.auto_block_text.pack(padx=10, pady=10)
         
         ttk.Button(tab, text="Save Keywords", command=self.save_auto_block).pack(pady=5)
     
+    def create_textaloud_tab(self):
+        """TextAloud tab: voices that only run inside TextAloud (Acapela Will From Afar etc.)"""
+        tab = self.add_tab("TextAloud")
+
+        ttk.Label(tab, wraplength=900, justify=tk.LEFT, text=(
+            "Voices bought for TextAloud (like Acapela Will From Afar) only work inside TextAloud, so the TTS has "
+            "TextAloud say each line into a sound file and plays it like DECtalk: same output device, !stop, mutes "
+            "and music ducking. TextAloud runs hidden - no window or tray icon - starting when one of its voices is "
+            "needed and closing when the TTS closes. If TextAloud crashes, its error box is closed for you and the "
+            "line is tried again, or said in the Default Voice.")).pack(anchor=tk.W, padx=10, pady=10)
+
+        row = ttk.Frame(tab)
+        row.pack(fill=tk.X, padx=10, pady=5)
+        self.textaloud_enabled_var = tk.BooleanVar(value=self.textaloud_enabled)
+        ttk.Checkbutton(row, text="Use TextAloud voices", variable=self.textaloud_enabled_var,
+                        command=self.on_textaloud_toggle).pack(side=tk.LEFT)
+        ttk.Button(row, text="Find Voices",
+                   command=lambda: self.refresh_textaloud_voices(from_button=True)).pack(side=tk.LEFT, padx=10)
+
+        row = ttk.Frame(tab)
+        row.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(row, text="Voices:").pack(side=tk.LEFT)
+        self.textaloud_status_label = ttk.Label(row, text=self.textaloud_status_text())
+        self.textaloud_status_label.pack(side=tk.LEFT, padx=5)
+
+        row = ttk.Frame(tab)
+        row.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(row, text="Volume:").pack(side=tk.LEFT)
+        self.textaloud_volume_var = tk.DoubleVar(value=self.textaloud_volume)
+        ttk.Scale(row, from_=0.0, to=1.5, variable=self.textaloud_volume_var,
+                  orient=tk.HORIZONTAL, length=300).pack(side=tk.LEFT, padx=5)
+        self.textaloud_volume_label = ttk.Label(row, text=f"{int(self.textaloud_volume * 100)}%")
+        self.textaloud_volume_label.pack(side=tk.LEFT)
+        self.textaloud_volume_var.trace('w', self.update_textaloud_volume_label)
+
+        row = ttk.Frame(tab)
+        row.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(row, text="Close TextAloud after").pack(side=tk.LEFT)
+        self.textaloud_idle_var = tk.StringVar(value=f"{float(self.config.get('textaloud_idle_minutes', 10)):g}")
+        idle_box = ttk.Spinbox(row, from_=0, to=120, width=5, textvariable=self.textaloud_idle_var,
+                               command=self.save_textaloud_idle)
+        idle_box.pack(side=tk.LEFT, padx=5)
+        idle_box.bind('<FocusOut>', lambda e: self.save_textaloud_idle())
+        idle_box.bind('<Return>', lambda e: self.save_textaloud_idle())
+        ttk.Label(row, text="minutes without use (0 = keep it open; it starts again in ~2 s when needed)").pack(side=tk.LEFT)
+
+        ttk.Label(tab, wraplength=900, justify=tk.LEFT, text=(
+            "Give players these voices like any other: add a voice command for it (Voice Commands tab), set it as "
+            "someone's User Voice, the Default Voice, or the DJ voice.")).pack(anchor=tk.W, padx=10, pady=(15, 5))
+
+    def save_textaloud_idle(self):
+        try:
+            minutes = max(0.0, min(120.0, float(self.textaloud_idle_var.get())))
+        except ValueError:
+            minutes = float(self.config.get('textaloud_idle_minutes', 10))
+        self.textaloud_idle_var.set(f"{minutes:g}")
+        if self.config.get('textaloud_idle_minutes') != minutes:
+            self.config['textaloud_idle_minutes'] = minutes
+            self.save_config()
+        if self.textaloud:
+            self.textaloud.idle_minutes = minutes
+
+    # ------------------------------------------------------------------ Voices tab (more Windows voices, Piper)
+    def create_voices_tab(self):
+        """Voices tab: Windows' extra voices, and free Piper voices to download"""
+        tab = self.add_tab("Voices")
+        px = self.px
+
+        win = ttk.LabelFrame(tab, text="Windows voices", padding=px(8))
+        win.pack(fill=tk.X, padx=10, pady=(10, 5))
+        ttk.Label(win, wraplength=px(760), justify=tk.LEFT, style='Hint.TLabel', text=(
+            "Windows can add more voices and languages (Settings > Time & language > Speech > Add voices). "
+            "Windows keeps those apart from the voices programs like the TTS can use, so after adding some, press "
+            "\"Make them usable here\" (one Windows admin prompt) and restart the TTS.")).pack(anchor='w')
+        row = ttk.Frame(win)
+        row.pack(fill=tk.X, pady=(px(6), 0))
+        ttk.Button(row, text="Add voices in Windows Settings...",
+                   command=voice_installer.open_windows_voice_settings).pack(side=tk.LEFT)
+        ttk.Button(row, text="Make them usable here", command=self.make_windows_voices_usable).pack(side=tk.LEFT, padx=px(6))
+        ttk.Button(row, text="Undo", command=self.undo_windows_voices).pack(side=tk.LEFT)
+        self.windows_voice_label = ttk.Label(win, wraplength=px(760), justify=tk.LEFT)
+        self.windows_voice_label.pack(anchor='w', pady=(px(6), 0))
+
+        pf = ttk.LabelFrame(tab, text="Free voices (Piper)", padding=px(8))
+        pf.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        ttk.Label(pf, wraplength=px(760), justify=tk.LEFT, style='Hint.TLabel', text=(
+            "Natural-sounding voices that run on this PC, free (Piper, MIT licence; each voice has its own licence "
+            "in its MODEL_CARD). Each voice is a one-time download of about 20-130 MB. They play like DECtalk: same "
+            "output device, !stop and mutes.")).pack(anchor='w')
+        row = ttk.Frame(pf)
+        row.pack(fill=tk.X, pady=(px(6), px(4)))
+        self.piper_engine_label = ttk.Label(row, text="")
+        self.piper_engine_label.pack(side=tk.LEFT)
+        self.piper_engine_btn = ttk.Button(row, text="Download Piper (22 MB)", command=self.download_piper_engine)
+        self.piper_engine_btn.pack(side=tk.LEFT, padx=px(6))
+        row = ttk.Frame(pf)  # language filter on its own line so the row above stays narrow
+        row.pack(fill=tk.X, pady=(0, px(4)))
+        ttk.Label(row, text="Language:").pack(side=tk.LEFT)
+        self.piper_lang_var = tk.StringVar(value=self.config.get('piper_language', 'English'))
+        self.piper_lang_combo = ttk.Combobox(row, textvariable=self.piper_lang_var, state='readonly', width=24)
+        self.piper_lang_combo.pack(side=tk.LEFT, padx=px(6))
+        self.piper_lang_combo.bind('<<ComboboxSelected>>', lambda e: self.fill_piper_list())
+        ttk.Button(row, text="Refresh list", command=lambda: self.load_piper_catalog(refresh=True)).pack(side=tk.LEFT)
+
+        tree_frame = ttk.Frame(pf)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+        columns = ('voice', 'language', 'quality', 'size', 'status')
+        self.piper_tree = ttk.Treeview(tree_frame, columns=columns, show='headings', height=6, selectmode='browse')
+        for col, title, width in (('voice', 'Voice', 170), ('language', 'Language', 220), ('quality', 'Quality', 80),
+                                  ('size', 'Size', 80), ('status', '', 110)):
+            self.piper_tree.heading(col, text=title)
+            self.piper_tree.column(col, width=px(width), stretch=(col in ('voice', 'language')))
+        bar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.piper_tree.yview)
+        self.piper_tree.configure(yscrollcommand=bar.set)
+        bar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.piper_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.piper_tree.bind('<Double-1>', lambda e: self.download_piper_voice())
+
+        row = ttk.Frame(pf)
+        row.pack(fill=tk.X, pady=(px(6), 0))
+        self.piper_download_btn = ttk.Button(row, text="Download", command=self.download_piper_voice)
+        self.piper_download_btn.pack(side=tk.LEFT)
+        ttk.Button(row, text="Remove", command=self.remove_piper_voice).pack(side=tk.LEFT, padx=px(6))
+        ttk.Button(row, text="Test", command=self.test_piper_voice).pack(side=tk.LEFT)
+        ttk.Label(row, text="Volume:").pack(side=tk.LEFT, padx=(px(16), px(4)))
+        self.piper_volume_var = tk.DoubleVar(value=self.piper_volume)
+        ttk.Scale(row, from_=0.0, to=1.5, variable=self.piper_volume_var, orient=tk.HORIZONTAL,
+                  length=px(160)).pack(side=tk.LEFT)
+        self.piper_volume_label = ttk.Label(row, text=f"{int(self.piper_volume * 100)}%")
+        self.piper_volume_label.pack(side=tk.LEFT, padx=px(4))
+        self.piper_volume_var.trace('w', self.update_piper_volume_label)
+        self.piper_progress = ttk.Label(pf, text="", style='Hint.TLabel')
+        self.piper_progress.pack(anchor='w', pady=(px(4), 0))
+
+        self.piper_catalog = {}
+        self.piper_busy = False
+        self.refresh_windows_voice_label()
+        self.refresh_piper_engine_label()
+        self.load_piper_catalog(refresh=False)
+
+    # Windows voices
+    def refresh_windows_voice_label(self):
+        status = voice_installer.windows_voice_status()
+        usable = [d.split(' - ')[0].replace('Microsoft ', '') for t, d, st in status if st == 'usable']
+        new = [d.split(' - ')[0].replace('Microsoft ', '') for t, d, st in status if st == 'available']
+        text = f"Added here: {', '.join(usable) or 'none'}     Ready to add: {', '.join(new) or 'none'}"
+        self.windows_voice_label.config(text=text)
+
+    def make_windows_voices_usable(self):
+        new = [(t, d) for t, d, st in voice_installer.windows_voice_status() if st == 'available']
+        if not new:
+            messagebox.showinfo("Windows voices", "There are no new Windows voices to add.\n\nAdd some first with "
+                                "\"Add voices in Windows Settings\", then come back here.", parent=self.root)
+            return
+        names = "\n".join(d for t, d in new)
+        if not messagebox.askyesno("Windows voices", f"Make these usable in the TTS?\n\n{names}\n\nWindows will ask "
+                                   "for admin permission. An undo file is saved first.", parent=self.root):
+            return
+
+        def work():
+            ok, message = voice_installer.make_windows_voices_usable([t for t, d in new], self.voices_dir)
+            self.run_on_gui(lambda: (self.refresh_windows_voice_label(),
+                                     (messagebox.showinfo if ok else messagebox.showwarning)(
+                                         "Windows voices", message, parent=self.root)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def undo_windows_voices(self):
+        if not messagebox.askyesno("Windows voices", "Remove the Windows voices this TTS made usable?\n\n"
+                                   "Windows will ask for admin permission.", parent=self.root):
+            return
+
+        def work():
+            ok, message = voice_installer.undo_windows_voices(self.voices_dir)
+            self.run_on_gui(lambda: (self.refresh_windows_voice_label(),
+                                     (messagebox.showinfo if ok else messagebox.showwarning)(
+                                         "Windows voices", message, parent=self.root)))
+        threading.Thread(target=work, daemon=True).start()
+
+    # Piper voices
+    def refresh_piper_engine_label(self):
+        if self.piper.available():
+            self.piper_engine_label.config(text="Piper is installed.")
+            self.piper_engine_btn.pack_forget()
+        else:
+            self.piper_engine_label.config(text="Piper (the program that speaks these voices) isn't downloaded yet.")
+
+    def load_piper_catalog(self, refresh=False):
+        """The voice list: from the saved copy, or (refresh / first time) from Piper's site in the background"""
+        def work():
+            try:
+                catalog = voice_installer.load_catalog(self.voices_dir, refresh=refresh)
+                self.run_on_gui(lambda: self.on_piper_catalog(catalog))
+            except Exception as e:
+                logger.warning(f"Could not get Piper's voice list: {e}")
+                self.run_on_gui(lambda: self.piper_progress.config(
+                    text="Couldn't get the voice list - check the internet connection and press Refresh list"))
+        cached = (Path(self.voices_dir) / 'piper_catalog.json').exists()
+        if refresh or not cached:
+            self.piper_progress.config(text="Getting the voice list...")
+            threading.Thread(target=work, daemon=True).start()
+        else:
+            work()
+
+    def on_piper_catalog(self, catalog):
+        self.piper_catalog = catalog
+        families = sorted({v['language']['name_english'] for v in catalog.values()})
+        self.piper_lang_combo['values'] = ['All languages', 'Downloaded'] + families
+        if self.piper_lang_var.get() not in self.piper_lang_combo['values']:
+            self.piper_lang_var.set('English' if 'English' in families else 'All languages')
+        self.piper_progress.config(text=f"{len(catalog)} voices in {len(families)} languages")
+        self.fill_piper_list()
+
+    def fill_piper_list(self):
+        self.config['piper_language'] = self.piper_lang_var.get()
+        installed = set(voice_installer.installed_piper_voices(self.voices_dir))
+        want = self.piper_lang_var.get()
+        self.piper_tree.delete(*self.piper_tree.get_children())
+        for key, v in sorted(self.piper_catalog.items(),
+                             key=lambda kv: (kv[0] not in installed, kv[1]['language']['name_english'], kv[0])):
+            lang = v['language']
+            if want == 'Downloaded' and key not in installed:
+                continue
+            if want not in ('All languages', 'Downloaded') and lang['name_english'] != want:
+                continue
+            size = voice_installer.voice_files(v)[2] / 1e6
+            self.piper_tree.insert('', tk.END, iid=key, values=(
+                key.split('-')[1] if key.count('-') >= 2 else key,
+                f"{lang['name_english']} ({lang['country_english']})", v['quality'], f"{size:.0f} MB",
+                "downloaded" if key in installed else ""))
+
+    def selected_piper_key(self):
+        sel = self.piper_tree.selection()
+        if not sel:
+            messagebox.showinfo("Voices", "Pick a voice in the list first.", parent=self.root)
+            return None
+        return sel[0]
+
+    def piper_progress_cb(self, label):
+        last = {'t': 0}
+
+        def progress(done, total):
+            if time.time() - last['t'] < 0.2 and done < total:
+                return
+            last['t'] = time.time()
+            pct = f" {done * 100 // total}%" if total else ""
+            self.run_on_gui(lambda: self.piper_progress.config(text=f"{label}{pct} ({done / 1e6:.0f} MB)"))
+        return progress
+
+    def download_piper_engine(self, then=None):
+        if self.piper_busy:
+            return
+        self.piper_busy = True
+
+        def work():
+            try:
+                voice_installer.install_piper_engine(self.voices_dir, progress=self.piper_progress_cb("Downloading Piper"))
+                self.run_on_gui(lambda: (self.piper_progress.config(text="Piper downloaded."),
+                                         self.refresh_piper_engine_label()))
+                if then:
+                    self.run_on_gui(then)
+            except Exception as e:
+                logger.error(f"Piper download failed: {e}")
+                self.run_on_gui(lambda: self.piper_progress.config(text=f"Piper download failed: {e}"))
+            finally:
+                self.piper_busy = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def download_piper_voice(self):
+        key = self.selected_piper_key()
+        if not key or self.piper_busy:
+            return
+        if key in voice_installer.installed_piper_voices(self.voices_dir):
+            self.piper_progress.config(text=f"{key} is already downloaded - press Test to hear it")
+            return
+        if not self.piper.available():
+            self.download_piper_engine(then=self.download_piper_voice)  # the engine first, then this voice
+            return
+        entry = self.piper_catalog[key]
+        self.piper_busy = True
+
+        def work():
+            try:
+                voice_installer.install_piper_voice(self.voices_dir, entry,
+                                                    progress=self.piper_progress_cb(f"Downloading {key}"))
+                self.run_on_gui(lambda: (self.piper_progress.config(
+                    text=f"{key} downloaded - it's in the voice lists as {PIPER_PREFIX}{key}"),
+                    self.fill_piper_list(), self.refresh_textaloud_lists()))
+            except Exception as e:
+                logger.error(f"Voice download failed: {e}")
+                self.run_on_gui(lambda: self.piper_progress.config(text=f"Download failed: {e}"))
+            finally:
+                self.piper_busy = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def remove_piper_voice(self):
+        key = self.selected_piper_key()
+        if not key or key not in voice_installer.installed_piper_voices(self.voices_dir):
+            return
+        if not messagebox.askyesno("Voices", f"Delete the voice {key}?\n\nPlayers who use it get the default "
+                                   "voice until you download it again.", parent=self.root):
+            return
+        self.piper._kill(key)
+        voice_installer.remove_piper_voice(self.voices_dir, key)
+        self.piper_progress.config(text=f"{key} removed")
+        self.fill_piper_list()
+        self.refresh_textaloud_lists()
+
+    def test_piper_voice(self):
+        key = self.selected_piper_key()
+        if not key:
+            return
+        if key not in voice_installer.installed_piper_voices(self.voices_dir) or not self.piper.available():
+            self.piper_progress.config(text="Download the voice first")
+            return
+
+        def work():
+            from temp_utils import get_temp_file, release_temp_file
+            wav = get_temp_file(suffix='.wav', prefix='tts_piper_')
+            try:
+                name = key.split('-')[1] if key.count('-') >= 2 else key
+                if self.piper.render(f"Hello, this is {name}.", key, wav):
+                    self.dectalk_native._play_wav(wav, self.config.get('audio_device', 'Default'), self.piper_volume)
+            finally:
+                release_temp_file(wav)
+        threading.Thread(target=work, daemon=True).start()
+
+    def update_piper_volume_label(self, *args):
+        volume = self.piper_volume_var.get()
+        self.piper_volume_label.config(text=f"{int(volume * 100)}%")
+        self.piper_volume = volume
+        self.config['piper_volume'] = volume
+        if getattr(self, '_volume_save_job', None):
+            self.root.after_cancel(self._volume_save_job)
+        self._volume_save_job = self.root.after(500, self.save_config)
+
     def create_help_tab(self):
         """Help tab with instructions and information"""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Help")
+        tab = self.add_tab("Help")
         
         # Create scrolled text for help content
-        help_text = scrolledtext.ScrolledText(tab, wrap=tk.WORD, width=80, height=20)
+        help_text = ui_theme.ScrolledText(tab, wrap=tk.WORD, width=80, height=20)
         help_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        help_content = """TTS FOR TEAM FORTRESS 2 - HELP GUIDE
-=====================================
+        prefix = self.get_current_game_config().get('tts_command_prefix', '!tts')
+        toggle = self.voice_toggle_command or '/vt'
+        help_content = f"""TTS FOR TEAM FORTRESS 2 - HELP
+==============================
 
-QUICK START:
-1. Set your TF2 log path in Settings tab
-2. Select your audio output device in Audio Devices tab  
-3. Start monitoring to begin
+GETTING STARTED
+1. Settings tab: pick the game (or + Add Game) and check its log file path.
+2. Audio Devices tab: pick where the voices play (e.g. "VoiceMeeter Input" to send them into voice chat).
+3. Add yourself under ADMINS on the right and press Save.
+4. Press Start TTS.
+In the game's console the log must be on: con_logfile log.txt (the TTS reads it; nothing is sent to the game).
 
-VOICE COMMANDS:
-• /v 0-###: Quick voice selection
-• Custom commands in Voice Commands tab
+WHAT PLAYERS TYPE
+  {prefix} hello there	speak "hello there" in their voice
+  {prefix} /v 3 hello	say it in voice 3 this time (the numbers are on the Voice Commands tab)
+  {prefix} /sam hello	any custom trigger you made on the Voice Commands tab
+  {prefix} {toggle} 3 hello	make voice 3 their voice from now on (the text is optional)
+  {prefix} [:np] hello	DECtalk codes always use DECtalk for that line, even if their voice is another one
+New players get a random voice if Random Voice is on (Settings), unless you set one under USER VOICES.
 
-USER VOICE PREFERENCES:
-• Users set default voice with: /vt [voice name]
-• Example: "/vt 0 (Microsoft Sam)"
-• Preference saved automatically, and speaks message if one was sent
+ADMIN COMMANDS (only people in the ADMINS list)
+  !stop	stop all speech and clear the queue
+  !block	block whoever is talking now (or whoever used {prefix} last)
+  !block clear	unblock the most recently blocked player
+  !admin add	make whoever used {prefix} last an admin
+  !mute	mute whoever is talking for the time set under MUTED (!mute 30 = 30 minutes)
+  !unmute	lift the most recent mute
+Lists on the right: select a name and use the buttons; press Save after adding or removing.
+Spam guard: the same message repeated (or a burst of messages) mutes that player automatically.
 
-ADMIN COMMANDS:
-• !block [username]: Block a user
-• !unblock [username]: Unblock a user
-• !admin [username]: Add admin
-• !unadmin [username]: Remove admin
-• !stop : stop all voice, clear que
+MUSIC - the DJ button
+  !sr song name or YouTube link	request a song (off / admins / everyone - DJ window, Options)
+  !skipsong	skip the current song (admin)
+  !approve / !deny	handle the oldest request waiting for your OK (admin, if approval is on)
+DJ window keys: Space play/pause, Ctrl+Right next, Ctrl+Left previous, Ctrl+S stop, Delete remove,
+Ctrl+Up / Ctrl+Down move a song, Ctrl+O add files, Ctrl+F search.
+The music gets quieter while a voice talks. "Download ffmpeg" in the DJ window if it says ffmpeg is missing.
 
-SPECIAL FEATURES:
-• Longform Text: Type longer messages and Send
-• Auto-block: Add keywords to block
-• DECtalk: Classic voices with profiles
+SOUNDS - the Sounds button
+Put sound files in the "sounds" folder next to the TTS; the file name is the word (yee.wav -> yee).
+Depending on the mode players type the word, or the command and the word (!s yee). Adding a number
+changes the pitch (yee 150). Cooldowns and who may use them are in the Sounds window.
 
-AUDIO ROUTING:
-• Select "Voicemeeter Input" for virtual cable
-• Use "Default" for standard speakers
+SILENT KEYS (tts.cfg in TF2's cfg folder, exec it from autoexec.cfg)
+The keys write a line into the log as if you had typed it, without anything appearing in game chat:
+  Numpad /	!stop
+  Numpad -	!block
+  Numpad +	!admin add
+  Numpad *	!block clear
+  Numpad .	!mute
+  Numpad 7	!approve
+  Numpad 8	!skipsong
+  Numpad 9	!deny
+  Numpad Enter	voice chat on/off
+Change the name in tts.cfg (echo YourName : !stop) to your own Steam name.
 
-Version: TTS TF2 64-bit v2.0
-Build: Full Featured"""
-        
+OTHER
+  Long-form box: longer text or DECtalk songs, spoken in the voice you pick next to it.
+  Quick Speak: try a line out loud. Apply saves the Settings tab.
+  Announcements tab: what the TTS says when someone is blocked, muted, requests a song...
+  Auto Block tab: words that block a player automatically.
+  Appearance (Settings): Match Windows, Light or Dark. Drag the dividers to resize the sections."""
+
+        help_text.configure(tabs=(self.px(260),))  # the columns below are tab-separated
         help_text.insert("1.0", help_content)
         help_text.config(state='disabled')  # Make read-only
         
@@ -1962,7 +2471,7 @@ Build: Full Featured"""
         if not log_path and self.current_game_key() == 'tf2':
             log_path = self.config.get('log_path', '')  # TF2's legacy top-level copy, never another game's
         self.log_path_var.set(log_path)
-        self.admin_username_var.set(self.config.get('admin_username', 'Huskiefluffs'))
+        self.admin_username_var.set(self.config.get('admin_username', ''))
         self.private_mode_var.set(self.config.get('private_mode', False))
         
         # Populate long-form voice combo now that GUI is ready
@@ -2049,10 +2558,6 @@ Build: Full Featured"""
             logger.info(f"Blocked user {msg['username']} tried to speak")
             return
 
-        # Temporarily muted (!mute, spam guard, or the MUTED list) - shown above but not spoken
-        if self.is_muted(msg['username']):
-            logger.info(f"Muted user {msg['username']} tried to speak")
-            return
 
         # SECOND: Check auto-block keywords BEFORE any other processing
         if self.auto_block_var.get():
@@ -2243,22 +2748,68 @@ Build: Full Featured"""
                     logger.info("Nobody is muted")
             return
 
-        # DJ: "!sr <YouTube link or song name>" requests a song (when requests are on in the DJ window);
-        # admins can "!skipsong". Blocked and muted players never get here.
+        # DJ admin commands: !skipsong skips the current song; !approve / !deny handle the oldest request
+        # waiting for the DJ's OK (also from a silent key). Above the muted check, like the other admin commands.
         lowered = message.lower()
-        if self.dj and (lowered == '!sr' or lowered.startswith('!sr ')):
-            is_admin = msg['username'] in admins
-            if self.private_mode_var.get() and not is_admin:
-                return
-            def reply(text):
-                self.run_on_gui(lambda: (self.chat_display.insert(tk.END, f"[DJ] {text}\n"),
-                                         self.chat_display.see(tk.END)))
-            if not self.dj.request(msg['username'], message[3:], is_admin, reply):
-                logger.info(f"Song request from {msg['username']} ignored (requests are off for them)")
-            return
         if self.dj and lowered == '!skipsong':
             if msg['username'] in admins:
                 self.dj.skip()
+            return
+        if self.dj and lowered in ('!approve', '!deny'):
+            if msg['username'] in admins:
+                if not self.dj.pending:
+                    logger.info("No song requests are waiting")
+                elif lowered == '!approve':
+                    self.dj.approve_request(0)
+                else:
+                    self.dj.deny_request(0)
+            return
+
+        # Temporarily muted (!mute, spam guard, or the MUTED list): nothing from here down - TTS, song
+        # requests, soundboard. It comes after the admin commands so a muted admin can still !stop / !unmute.
+        if self.is_muted(msg['username']):
+            logger.info(f"Muted user {msg['username']} tried to speak")
+            return
+
+        # DJ: "!sr <YouTube link or song name>" requests a song (when requests are on in the DJ window).
+        # Blocked and muted players never get here.
+        if self.dj and (lowered == '!sr' or lowered.startswith('!sr ')):
+            username = msg['username']
+            is_admin = username in admins
+            if self.private_mode_var.get() and not is_admin:
+                return
+            if not self.dj.request_allowed(is_admin):
+                logger.info(f"Song request from {username} ignored (requests are off for them)")
+                return
+            # !sr spam counts toward the spam guard like !tts does
+            if not is_admin and self.check_spam(username, message):
+                logger.info(f"Spam guard: muting {username} (song requests)")
+                self.mute_user(username, announcement='SPAM MUTED')
+                return
+            def reply(text, outcome=None, title=None, reason=None):
+                """The DJ's answer: a line in the TTS window, and spoken so the player knows (if the TTS is on)"""
+                self.run_on_gui(lambda: (self.chat_display.insert(tk.END, f"[DJ] {text}\n"),
+                                         self.chat_display.see(tk.END)))
+                if not self.is_running:
+                    return
+                if outcome == 'denied':
+                    # automatic refusals: at most one spoken per player every 30 s, so it can't be used to spam
+                    now = time.time()
+                    last = self._last_denied_announce.get(username, 0)
+                    if now - last < 30:
+                        return
+                    self._last_denied_announce[username] = now
+                    self.queue_announcement_next('REQUEST DENIED', username=username, fill={'reason': reason},
+                                                 voice=self.dj_voice())
+                elif outcome == 'dj_denied':  # the DJ said no - always told
+                    self.queue_announcement_next('REQUEST DENIED', username=username, fill={'reason': reason},
+                                                 voice=self.dj_voice())
+                elif outcome in ('accepted', 'pending', 'approved'):
+                    kind = {'accepted': 'SONG REQUESTED', 'pending': 'REQUEST PENDING',
+                            'approved': 'REQUEST APPROVED'}[outcome]
+                    self.queue_announcement_next(kind, username=username, fill={'title': clean_title(title or '')},
+                                                 voice=self.dj_voice())
+            self.dj.request(username, message[3:], is_admin, reply)
             return
 
         # Soundboard: "yee" / "yee 150" (open mode) or "!s yee" (command mode) plays right away - no queue.
@@ -2577,10 +3128,9 @@ Build: Full Featured"""
         """Apply specific voice"""
         logger.info(f"apply_voice called with: {voice_name}")
         if self.voices and self.audio_manager:
-            # Check if it's a DECtalk profile
-            if voice_name.startswith("[DECtalk] "):
-                # DECtalk will be handled in speech processing
-                logger.info(f"DECtalk profile selected: {voice_name}")
+            # DECtalk profiles and TextAloud voices are handled in speech processing
+            if is_special_voice(voice_name):
+                logger.info(f"Special voice selected: {voice_name}")
                 return True
             
             
@@ -2631,8 +3181,8 @@ Build: Full Featured"""
         if self.dectalk_enabled and self.dectalk_profiles:
             for profile_name in sorted(self.dectalk_profiles.keys()):
                 voice_list.append(f"[DECtalk] {profile_name}")
-        
-        
+        voice_list += self.extra_voice_names()
+
         # Update combo box
         self.longform_voice_combo['values'] = voice_list
         logger.info(f"Populated long-form voice combo with {len(voice_list)} voices")
@@ -2712,17 +3262,17 @@ Build: Full Featured"""
                     text_to_speak = msg['text']
                     current_voice = msg.get('voice')
                     
-                    # If no voice specified in message, check if user has a DECtalk preference
+                    # If no voice specified in message, check if user has a DECtalk/TextAloud preference
                     if not current_voice:
                         username = msg.get('username')
                         if username and username in self.user_voice_preferences:
                             user_voice = self.user_voice_preferences[username]
-                            if user_voice.startswith("[DECtalk] "):
+                            if is_special_voice(user_voice):
                                 current_voice = user_voice
-                                logger.info(f"Using {username}'s DECtalk preference: {current_voice}")
-                        elif str(self.config.get('default_voice', '')).startswith("[DECtalk] "):
-                            # No voice of their own and the Default Voice is DECtalk (apply_default_voice only
-                            # knows Windows voices, so without this they'd get whichever Windows voice was last)
+                                logger.info(f"Using {username}'s preference: {current_voice}")
+                        elif is_special_voice(str(self.config.get('default_voice', ''))):
+                            # No voice of their own and the Default Voice is DECtalk/TextAloud (apply_default_voice
+                            # only knows Windows voices, so without this they'd get whichever Windows voice was last)
                             current_voice = self.config['default_voice']
 
                     # DECtalk commands sent with a non-DECtalk voice: use DECtalk for this one message only
@@ -2785,11 +3335,28 @@ Build: Full Featured"""
                                 logger.info("DECtalk speech did not complete (stopped or failed)")
                         else:
                             logger.warning("DECtalk not available, falling back to SAPI5")
-                            self.audio_manager.speak(text_to_speak, use_sync=False)
+                            self.audio_manager.speak(text_to_speak, use_sync=False, tag=msg.get('username'))
+                    elif current_voice and current_voice.startswith(PIPER_PREFIX):
+                        logger.info(f"Using Piper voice: {current_voice}")
+                        if self.speak_piper(text_to_speak, current_voice, msg.get('username')):
+                            used_special_voice = True
+                        else:
+                            logger.warning("Piper voice unavailable, using the default voice")
+                            self.apply_default_voice()
+                            self.audio_manager.speak(text_to_speak, use_sync=False, tag=msg.get('username'))
+                    elif current_voice and current_voice.startswith(TEXTALOUD_PREFIX):
+                        logger.info(f"Using TextAloud voice: {current_voice}")
+                        if self.speak_textaloud(text_to_speak, current_voice, msg.get('username')):
+                            used_special_voice = True
+                        else:
+                            # TextAloud missing or broken: say it in the Default Voice rather than lose the line
+                            logger.warning("TextAloud voice unavailable, using the default voice")
+                            self.apply_default_voice()
+                            self.audio_manager.speak(text_to_speak, use_sync=False, tag=msg.get('username'))
                     else:
                         # Normal SAPI5 speech
                         logger.info(f"Using SAPI5 speech - Voice: {current_voice}")
-                        self.audio_manager.speak(text_to_speak, use_sync=False)
+                        self.audio_manager.speak(text_to_speak, use_sync=False, tag=msg.get('username'))
                     
                     # Wait for speech to complete or be interrupted (only for SAPI5)
                     # Windows voices normally don't hold up the queue, so DECtalk and Windows voices can talk over
@@ -2853,6 +3420,133 @@ Build: Full Featured"""
             return f"[DECtalk] {next(iter(profiles))}"
         return None
 
+    # TextAloud voices (Will From Afar etc.)
+    def extra_voice_names(self):
+        """TextAloud and Piper voices for the voice lists"""
+        names = self.textaloud_voice_names()
+        if getattr(self, 'piper', None):
+            names += self.piper.voice_names()
+        return names
+
+    def textaloud_voice_names(self):
+        """'[TextAloud] ...' entries for the voice lists - empty when switched off or TextAloud isn't installed"""
+        if not (self.textaloud and self.textaloud_enabled and textaloud_installed()):
+            return []
+        return [TEXTALOUD_PREFIX + v for v in self.config.get('textaloud_voices', [])]
+
+    def textaloud_status_text(self):
+        if not (self.textaloud and textaloud_installed()):
+            return "TextAloud 3 isn't installed"
+        if not self.textaloud_enabled:
+            return "Off"
+        voices = self.config.get('textaloud_voices', [])
+        return ", ".join(voices) if voices else "No extra voices found yet - click Find Voices"
+
+    def refresh_textaloud_voices(self, from_button=False):
+        """Ask TextAloud which voices it has - in the background, since starting TextAloud takes a few seconds"""
+        if not (self.textaloud and textaloud_installed()):
+            if from_button:
+                messagebox.showinfo("TextAloud", "TextAloud 3 isn't installed on this PC.")
+            return
+        if hasattr(self, 'textaloud_status_label'):
+            self.textaloud_status_label.config(text="Asking TextAloud...")
+        windows = [v.name for v in (self.voices or [])]
+
+        def work():
+            try:
+                voices = self.textaloud.list_voices(windows)
+                # Don't leave it running just for the list - it starts again when one of its voices speaks
+                self.textaloud.shutdown()
+            except Exception as e:
+                logger.error(f"Could not get TextAloud's voices: {e}")
+                voices = None
+            self.run_on_gui(lambda: self.on_textaloud_voices(voices))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_textaloud_voices(self, voices):
+        if voices is None:
+            if hasattr(self, 'textaloud_status_label'):
+                self.textaloud_status_label.config(text="Couldn't reach TextAloud - see tts_tf2.log")
+            return
+        self.config['textaloud_voices'] = voices
+        self.save_config()
+        self.refresh_textaloud_lists()
+
+    def refresh_textaloud_lists(self):
+        if hasattr(self, 'textaloud_status_label'):
+            self.textaloud_status_label.config(text=self.textaloud_status_text())
+        self.refresh_voice_combos()
+        if hasattr(self, 'longform_voice_combo'):
+            self.populate_longform_voice_combo()
+        self.refresh_available_voices()
+
+    def on_textaloud_toggle(self):
+        self.textaloud_enabled = self.textaloud_enabled_var.get()
+        self.config['textaloud_enabled'] = self.textaloud_enabled
+        self.save_config()
+        if self.textaloud_enabled and not self.config.get('textaloud_voices'):
+            self.refresh_textaloud_voices(from_button=True)
+        else:
+            self.refresh_textaloud_lists()
+
+    def update_textaloud_volume_label(self, *args):
+        volume = self.textaloud_volume_var.get()
+        self.textaloud_volume_label.config(text=f"{int(volume * 100)}%")
+        self.textaloud_volume = volume
+        self.config['textaloud_volume'] = volume
+        if getattr(self, '_volume_save_job', None):
+            self.root.after_cancel(self._volume_save_job)
+        self._volume_save_job = self.root.after(500, self.save_config)
+
+    def speak_piper(self, text, voice_name, username):
+        """Speak one message in a Piper voice: Piper writes a WAV, which plays like DECtalk (same output device,
+        !stop, mutes and music ducking). False if Piper couldn't do it."""
+        from temp_utils import get_temp_file, release_temp_file
+        player = getattr(self, 'dectalk_native', None)
+        if not (self.piper and self.piper.available() and hasattr(player, '_play_wav')):
+            return False
+        wav_path = get_temp_file(suffix='.wav', prefix='tts_piper_')
+        player.stop_requested = False
+
+        def stopped():
+            return player.stop_requested or self.currently_speaking_user != username
+        try:
+            if not self.piper.render(text, voice_name[len(PIPER_PREFIX):], wav_path, should_stop=stopped):
+                return stopped()  # cut off by !stop or a mute: not a failure
+            if not stopped():
+                player._play_wav(wav_path, self.config.get('audio_device', 'Default'), self.piper_volume)
+            return True
+        except Exception as e:
+            logger.error(f"Piper voice '{voice_name}' failed: {e}")
+            return False
+        finally:
+            release_temp_file(wav_path)
+
+    def speak_textaloud(self, text, voice_name, username):
+        """Speak one message in a TextAloud voice: TextAloud writes it to a WAV, which plays like DECtalk (same
+        output device, !stop, mutes and music ducking). False if TextAloud couldn't do it."""
+        from temp_utils import get_temp_file, release_temp_file
+        player = getattr(self, 'dectalk_native', None)
+        if not (self.textaloud and hasattr(player, '_play_wav')):
+            return False
+        voice = voice_name[len(TEXTALOUD_PREFIX):]
+        wav_path = get_temp_file(suffix='.wav', prefix='tts_textaloud_')
+        player.stop_requested = False  # set again by !stop (stop_all_speech) or a mute while this one is going
+
+        def stopped():
+            return player.stop_requested or self.currently_speaking_user != username
+        try:
+            if not self.textaloud.render(text, voice, wav_path, should_stop=stopped):
+                return stopped()  # cut off during the ~1 s render: not a failure, so no fallback voice
+            if not stopped():
+                player._play_wav(wav_path, self.config.get('audio_device', 'Default'), self.textaloud_volume)
+            return True
+        except Exception as e:
+            logger.error(f"TextAloud voice '{voice}' failed: {e}")
+            return False
+        finally:
+            release_temp_file(wav_path)
+
     def speak_with_voice(self, text, voice_name, username=None):
         """Queue text with a specific voice"""
         if not self.audio_manager:
@@ -2874,17 +3568,21 @@ Build: Full Featured"""
                 # Don't save yet - let the caller do that after announcement
                 logger.info(f"Added {username} to blocked list")
             
-        # Stop current speech if it's from this user
+        # Cut them off right away - only them, everyone else keeps talking. Windows-voice messages are handed
+        # to the speech worker straight away, so theirs may be playing or waiting there:
+        if self.audio_manager and hasattr(self.audio_manager, 'stop_user'):
+            try:
+                self.audio_manager.stop_user(username)
+            except Exception as e:
+                logger.error(f"Could not stop {username}'s speech: {e}")
+        # DECtalk plays inside the speech thread, so while it's theirs currently_speaking_user is them
         if self.currently_speaking_user == username:
-            if self.audio_manager:
-                # Try stopping multiple times for stubborn voices
-                for _ in range(3):
-                    self.audio_manager.stop_all_speech()
-                    import time
-                    time.sleep(0.05)  # Small delay between attempts
-                # Clear the flag to signal the queue processor to stop waiting
-                self.currently_speaking_user = None
-                logger.info(f"Stopped current speech from blocked user: {username}")
+            dectalk = getattr(self, 'dectalk_native', None)
+            if dectalk and hasattr(dectalk, 'is_playing') and dectalk.is_playing():
+                dectalk.stop_speech()
+            # Clear the flag to signal the queue processor to stop waiting
+            self.currently_speaking_user = None
+            logger.info(f"Stopped current speech from {username}")
         
         # Remove all queued messages from this user
         temp_queue = []
@@ -2908,18 +3606,32 @@ Build: Full Featured"""
         if removed_count > 0:
             logger.info(f"Removed {removed_count} queued messages from {username}")
 
-    def queue_announcement_next(self, announcement_type, username=None):
-        """Put an announcement at the front of the speech queue, like the block announcements"""
+    def dj_voice(self):
+        """Voice for everything the DJ says (now playing, song-request messages): the DJ window's choice,
+        or the Announcements tab voice when that's set to Default"""
+        voice = self.config.get('dj', {}).get('announce_voice', 'Default')
+        if not voice or voice == 'Default':
+            voice = self.config.get('announcement_voice', '')
+        return voice
+
+    def queue_announcement_next(self, announcement_type, username=None, fill=None, voice=None):
+        """Put an announcement at the front of the speech queue, like the block announcements.
+        fill: values for {placeholders} in the announcement text, e.g. {'title': ..., 'reason': ...}
+        voice: who says it (default: the Announcements tab voice)"""
         announcement_text = self.get_announcement_text(announcement_type, username=username)
         if not announcement_text:
             return
+        for key, value in (fill or {}).items():
+            # brackets out: a song title can't smuggle DECtalk commands into the announcement
+            safe = str(value or '').replace('[', ' ').replace(']', ' ').replace('<', ' ').replace('>', ' ')
+            announcement_text = announcement_text.replace('{' + key + '}', safe)
         waiting = []
         while not self.message_queue.empty():
             try:
                 waiting.append(self.message_queue.get_nowait())
             except queue.Empty:
                 break
-        announcement_voice = self.config.get('announcement_voice', '')
+        announcement_voice = voice or self.config.get('announcement_voice', '')
         self.message_queue.put({'text': announcement_text, 'voice': announcement_voice, 'username': '__announcement__'})
         for item in waiting:
             self.message_queue.put(item)
@@ -3038,6 +3750,11 @@ Build: Full Featured"""
                 self.config['mute_minutes'] = minutes
         except ValueError:
             self.mute_minutes_var.set(str(self.config.get('mute_minutes', 10)))
+        if hasattr(self, 'spam_repeat_var'):
+            try:
+                self.config['spam_repeat_count'] = max(2, min(10, int(self.spam_repeat_var.get())))
+            except ValueError:
+                self.spam_repeat_var.set(str(self.config.get('spam_repeat_count', 3)))
         self.save_config()
 
     def get_announcement_text(self, announcement_type, text="", username=None):
@@ -3117,7 +3834,7 @@ Build: Full Featured"""
                             logger.debug(f"Speak test - Already using voice: {default_voice}")
                         break
             # A DECtalk default voice isn't a Windows voice, so it has to ride along with the message
-            self.speak(text, voice_name=default_voice if default_voice.startswith("[DECtalk] ") else None)
+            self.speak(text, voice_name=default_voice if is_special_voice(default_voice) else None)
 
     
     def update_ui_after_autoblock(self, username):
@@ -3318,12 +4035,13 @@ Build: Full Featured"""
             if self.dectalk_enabled and self.dectalk_profiles:
                 for profile_name in self.dectalk_profiles.keys():
                     voice_names.append(f"[DECtalk] {profile_name}")
+            voice_names += self.extra_voice_names()
             
             from tkinter import messagebox
             # Create custom dialog for voice selection
             dialog = tk.Toplevel(self.root)
             dialog.title("Select Voice")
-            dialog.geometry("400x300")
+            ui_theme.size_window(dialog, 400, 300, self.root)
             
             ttk.Label(dialog, text=f"Select voice for {username}:").pack(pady=10)
             
@@ -3367,10 +4085,11 @@ Build: Full Featured"""
             if self.dectalk_enabled and self.dectalk_profiles:
                 for profile_name in self.dectalk_profiles.keys():
                     voice_names.append(f"[DECtalk] {profile_name}")
+            voice_names += self.extra_voice_names()
             
             dialog = tk.Toplevel(self.root)
             dialog.title("Edit Voice")
-            dialog.geometry("400x300")
+            ui_theme.size_window(dialog, 400, 300, self.root)
             
             ttk.Label(dialog, text=f"Select new voice for {username}:").pack(pady=10)
             
@@ -3464,6 +4183,7 @@ Build: Full Featured"""
             dectalk_profiles = self.dectalk_native.get_available_profiles()
             for profile in dectalk_profiles:
                 voice_names.append(f"[DECtalk] {profile}")
+        voice_names += self.extra_voice_names()
         
         
         # Update default voice combo
@@ -3687,6 +4407,8 @@ Build: Full Featured"""
         if self.dectalk_enabled and self.dectalk_profiles:
             for profile_name in self.dectalk_profiles.keys():
                 self.available_voices_listbox.insert(tk.END, f"[DECtalk] {profile_name}")
+        for name in self.extra_voice_names():
+            self.available_voices_listbox.insert(tk.END, name)
         
             
     def hide_selected_voices(self):
@@ -3746,9 +4468,9 @@ Build: Full Featured"""
             # Show in dialog
             dialog = tk.Toplevel(self.root)
             dialog.title("Duplicate Voices Report")
-            dialog.geometry("500x400")
+            ui_theme.size_window(dialog, 500, 400, self.root)
             
-            text = scrolledtext.ScrolledText(dialog, wrap=tk.WORD)
+            text = ui_theme.ScrolledText(dialog, wrap=tk.WORD)
             text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
             text.insert(1.0, report)
             text.config(state=tk.DISABLED)
@@ -3777,7 +4499,7 @@ Build: Full Featured"""
         """Add a new voice command"""
         dialog = tk.Toplevel(self.root)
         dialog.title("Add Voice Command")
-        dialog.geometry("450x400")
+        ui_theme.size_window(dialog, 450, 400, self.root)
         dialog.transient(self.root)
         dialog.grab_set()
         
@@ -3788,7 +4510,7 @@ Build: Full Featured"""
         trigger_entry.pack(pady=5)
         
         # Preview label
-        preview_label = ttk.Label(dialog, text="Usage: !tts /[trigger] message", foreground='gray')
+        preview_label = ttk.Label(dialog, text="Usage: !tts /[trigger] message", style='Hint.TLabel')
         preview_label.pack(pady=5)
         
         def update_preview(*args):
@@ -3829,6 +4551,13 @@ Build: Full Featured"""
                 dectalk_label = f"[DECtalk] {profile_name}"
                 voice_names.append(dectalk_label)
                 voice_listbox.insert(tk.END, dectalk_label)
+        textaloud_names = self.extra_voice_names()
+        if textaloud_names:
+            voice_listbox.insert(tk.END, "")  # Separator
+            voice_listbox.insert(tk.END, "--- More Voices ---")
+            for name in textaloud_names:
+                voice_names.append(name)
+                voice_listbox.insert(tk.END, name)
         
         
         # Select first voice by default
@@ -3865,7 +4594,7 @@ Build: Full Featured"""
             selected_text = voice_listbox.get(sel[0])
             
             # Skip separator lines
-            if selected_text == "" or selected_text == "--- DECtalk Profiles ---":
+            if selected_text == "" or selected_text.startswith("---"):
                 messagebox.showerror("Invalid Selection", 
                                    "Please select a valid voice", parent=dialog)
                 return
@@ -3931,7 +4660,7 @@ Build: Full Featured"""
         
         dialog = tk.Toplevel(self.root)
         dialog.title(f"Edit Command: {old_cmd}")
-        dialog.geometry("450x400")
+        ui_theme.size_window(dialog, 450, 400, self.root)
         dialog.transient(self.root)
         dialog.grab_set()
         
@@ -3942,7 +4671,7 @@ Build: Full Featured"""
         trigger_entry.pack(pady=5)
         
         # Preview label
-        preview_label = ttk.Label(dialog, text=f"Usage: !tts /{old_cmd} message", foreground='gray')
+        preview_label = ttk.Label(dialog, text=f"Usage: !tts /{old_cmd} message", style='Hint.TLabel')
         preview_label.pack(pady=5)
         
         def update_preview(*args):
@@ -3983,6 +4712,13 @@ Build: Full Featured"""
                 dectalk_label = f"[DECtalk] {profile_name}"
                 voice_names.append(dectalk_label)
                 voice_listbox.insert(tk.END, dectalk_label)
+        textaloud_names = self.extra_voice_names()
+        if textaloud_names:
+            voice_listbox.insert(tk.END, "")  # Separator
+            voice_listbox.insert(tk.END, "--- More Voices ---")
+            for name in textaloud_names:
+                voice_names.append(name)
+                voice_listbox.insert(tk.END, name)
         
         
         # Select current voice - by listbox row (the list has divider rows that voice_names doesn't, so an
@@ -4025,7 +4761,7 @@ Build: Full Featured"""
             selected_text = voice_listbox.get(sel[0])
             
             # Skip separator lines
-            if selected_text == "" or selected_text == "--- DECtalk Profiles ---":
+            if selected_text == "" or selected_text.startswith("---"):
                 messagebox.showerror("Invalid Selection", 
                                    "Please select a valid voice", parent=dialog)
                 return
@@ -4073,7 +4809,7 @@ Build: Full Featured"""
             from tkinter import simpledialog
             dialog = tk.Toplevel(self.root)
             dialog.title(f"Edit Voice for {cmd}")
-            dialog.geometry("400x300")
+            ui_theme.size_window(dialog, 400, 300, self.root)
             
             ttk.Label(dialog, text=f"Select voice for command {cmd}:").pack(pady=10)
             
@@ -4096,6 +4832,13 @@ Build: Full Featured"""
                     dectalk_label = f"[DECtalk] {profile_name}"
                     voice_names.append(dectalk_label)
                     voice_listbox.insert(tk.END, dectalk_label)
+            textaloud_names = self.extra_voice_names()
+            if textaloud_names:
+                voice_listbox.insert(tk.END, "")  # Separator
+                voice_listbox.insert(tk.END, "--- More Voices ---")
+                for name in textaloud_names:
+                    voice_names.append(name)
+                    voice_listbox.insert(tk.END, name)
                 
             # Select current voice - by listbox row (the divider rows mean voice_names indexes don't line up)
             rows = list(voice_listbox.get(0, tk.END))
@@ -4169,15 +4912,14 @@ Build: Full Featured"""
     
     def create_announcements_tab(self):
         """Announcements tab with automated voice settings"""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Announcements")
+        tab = self.add_tab("Announcements")
         
         # Container
         container = ttk.Frame(tab)
         container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
         # Title and description
-        ttk.Label(container, text="AUTOMATED ANNOUNCEMENTS", font=('Arial', 12, 'bold')).pack(pady=5)
+        ttk.Label(container, text="AUTOMATED ANNOUNCEMENTS", style='Title.TLabel').pack(pady=5)
         ttk.Label(container, text="Configure announcement messages and voices").pack(pady=5)
         
         # Announcement voice selector
@@ -4217,7 +4959,11 @@ Build: Full Featured"""
             ("AUTOBLOCK TRIGGERED", "blocked, you can't say that"),
             ("TTS STOPPED", "TTS stopped by admin"),
             ("MUTED", DEFAULT_ANNOUNCEMENTS['MUTED']),
-            ("SPAM MUTED", DEFAULT_ANNOUNCEMENTS['SPAM MUTED'])
+            ("SPAM MUTED", DEFAULT_ANNOUNCEMENTS['SPAM MUTED']),
+            ("SONG REQUESTED", DEFAULT_ANNOUNCEMENTS['SONG REQUESTED']),
+            ("REQUEST DENIED", DEFAULT_ANNOUNCEMENTS['REQUEST DENIED']),
+            ("REQUEST PENDING", DEFAULT_ANNOUNCEMENTS['REQUEST PENDING']),
+            ("REQUEST APPROVED", DEFAULT_ANNOUNCEMENTS['REQUEST APPROVED'])
         ]
         
         self.announcement_vars = {}
@@ -4225,9 +4971,9 @@ Build: Full Featured"""
         self.announcement_defaults = {}  # for apply_config to refill the fields after Import/Reset/Reload
 
         # Headers
-        ttk.Label(announcements_frame, text="On", font=('Arial', 9, 'bold')).grid(row=0, column=0, padx=5, pady=3)
-        ttk.Label(announcements_frame, text="Type", font=('Arial', 9, 'bold')).grid(row=0, column=1, sticky=tk.W, padx=10, pady=3)
-        ttk.Label(announcements_frame, text="Message", font=('Arial', 9, 'bold')).grid(row=0, column=2, padx=10, pady=3)
+        ttk.Label(announcements_frame, text="On", style='Section.TLabel').grid(row=0, column=0, padx=5, pady=3)
+        ttk.Label(announcements_frame, text="Type", style='Section.TLabel').grid(row=0, column=1, sticky=tk.W, padx=10, pady=3)
+        ttk.Label(announcements_frame, text="Message", style='Section.TLabel').grid(row=0, column=2, padx=10, pady=3)
         
         for i, (label, default) in enumerate(announcements):
             row = i + 1  # Start from row 1 due to headers
@@ -4290,15 +5036,14 @@ Build: Full Featured"""
         
     def create_testing_tab(self):
         """Testing tab for simulating messages"""
-        tab = ttk.Frame(self.notebook)
-        self.notebook.add(tab, text="Testing")
+        tab = self.add_tab("Testing")
         
         # Main container
         main_frame = ttk.Frame(tab)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
         
         # Title
-        title_label = ttk.Label(main_frame, text="Test Message Simulator", font=('Arial', 12, 'bold'))
+        title_label = ttk.Label(main_frame, text="Test Message Simulator", style='Title.TLabel')
         title_label.pack(pady=(0, 10))
         
         # Description
@@ -4375,7 +5120,7 @@ Build: Full Featured"""
         output_frame = ttk.LabelFrame(main_frame, text="Test Output")
         output_frame.pack(fill=tk.BOTH, expand=True, pady=10)
         
-        self.test_output = scrolledtext.ScrolledText(output_frame, height=8, width=60)
+        self.test_output = ui_theme.ScrolledText(output_frame, height=8, width=60)
         self.test_output.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
     def send_test_message(self):
@@ -4598,6 +5343,11 @@ Build: Full Featured"""
             self.soundboard.shutdown()
         if self.audio_manager:
             self.audio_manager.stop()
+        if getattr(self, 'textaloud', None):
+            self.textaloud.shutdown()  # only if the TTS started it
+        if getattr(self, 'piper', None):
+            self.piper.shutdown()
+        self.remember_window_size()
         self.save_config()
         self.root.destroy()
 

@@ -23,6 +23,10 @@ from pathlib import Path
 
 import tkinter as tk
 from tkinter import ttk
+try:
+    import ui_theme  # sizes that follow Windows scaling, theme hint colour
+except Exception:
+    ui_theme = None
 
 try:
     import numpy as np
@@ -53,6 +57,7 @@ DEFAULTS = {
     'pitch_enabled': True,
     'duck_music': False,           # lower the DJ music while a sound plays (off = sounds play over it)
     'max_at_once': 3,              # sounds playing at the same time; more are dropped, never queued
+    'bass_db': 0,                  # bass boost/cut in dB (TF2's voice codec is boomy)
     'max_seconds': 30,             # clips are cut off after this long
 }
 
@@ -205,7 +210,8 @@ class SoundboardEngine:
         return bool(self._active)
 
     def _decode(self, word, path, pitch):
-        key = (word, pitch)
+        bass = float(self.get('bass_db') or 0)
+        key = (word, pitch, bass)
         with self._lock:
             if key in self._cache:
                 self._cache.move_to_end(key)
@@ -215,8 +221,13 @@ class SoundboardEngine:
             raise RuntimeError("ffmpeg isn't installed yet - click Download ffmpeg (Soundboard or DJ window)")
         cmd = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin', '-i', path, '-vn',
                '-t', str(int(self.get('max_seconds')))]
+        filters = []
         if pitch != 100:
-            cmd += ['-af', f'aresample={RATE},asetrate={int(RATE * pitch / 100)},aresample={RATE}']
+            filters.append(f'aresample={RATE},asetrate={int(RATE * pitch / 100)},aresample={RATE}')
+        if bass:
+            filters.append(f'bass=g={bass:g}:f=160:width_type=o:w=1')  # low shelf below ~160 Hz
+        if filters:
+            cmd += ['-af', ','.join(filters)]
         cmd += ['-f', 's16le', '-acodec', 'pcm_s16le', '-ac', str(CHANNELS), '-ar', str(RATE), 'pipe:1']
         out = subprocess.run(cmd, capture_output=True, timeout=20, creationflags=NO_WINDOW,
                              stdin=subprocess.DEVNULL)
@@ -302,8 +313,11 @@ class SoundboardWindow:
 
         self.win = tk.Toplevel(root)
         self.win.title("Soundboard")
-        self.win.geometry("760x700")
-        self.win.minsize(640, 560)
+        if ui_theme:
+            ui_theme.size_window(self.win, 900, 700, root, minsize=(640, 560))
+        else:
+            self.win.geometry("760x700")
+            self.win.minsize(640, 560)
         self.win.protocol("WM_DELETE_WINDOW", self.close)
 
         how = ttk.LabelFrame(self.win, text="How players trigger sounds")
@@ -320,7 +334,7 @@ class SoundboardWindow:
         command_entry.bind('<FocusOut>', lambda ev: self._save_command())
         command_entry.bind('<Return>', lambda ev: self._save_command())
         self.example_var = tk.StringVar()
-        ttk.Label(row, textvariable=self.example_var, foreground='gray').pack(side=tk.LEFT, padx=6)
+        ttk.Label(row, textvariable=self.example_var, style='Hint.TLabel').pack(side=tk.LEFT, padx=6)
 
         row = ttk.Frame(how)
         row.pack(fill=tk.X, padx=6, pady=2)
@@ -330,7 +344,7 @@ class SoundboardWindow:
             ttk.Radiobutton(row, text=text, value=value, variable=self.who_var,
                             command=lambda: e.set('who', self.who_var.get())).pack(side=tk.LEFT, padx=4)
         ttk.Label(row, text="(blocked and muted players never can; Private Mode = admins only)",
-                  foreground='gray').pack(side=tk.LEFT, padx=6)
+                  style='Hint.TLabel').pack(side=tk.LEFT, padx=6)
 
         row = ttk.Frame(how)
         row.pack(fill=tk.X, padx=6, pady=2)
@@ -363,6 +377,10 @@ class SoundboardWindow:
                   command=lambda v: self._set_volume()).pack(side=tk.LEFT, padx=6)
         self.volume_label = ttk.Label(row, text=f"{self.volume_var.get()}%", width=5)
         self.volume_label.pack(side=tk.LEFT)
+        ttk.Label(row, text="  Bass").pack(side=tk.LEFT)
+        self.bass_var = tk.StringVar(value=str(int(e.get('bass_db'))))
+        self._spin(row, self.bass_var, -15, 6, 1, lambda: self._save_bass())
+        ttk.Label(row, text="dB").pack(side=tk.LEFT)
         ttk.Label(row, text="  At once (max)").pack(side=tk.LEFT)
         self.max_var = tk.StringVar(value=str(e.get('max_at_once')))
         self._spin(row, self.max_var, 1, 10, 1, lambda: self._save_number('max_at_once', self.max_var, int))
@@ -396,7 +414,7 @@ class SoundboardWindow:
         ttk.Button(row, text="⏹ Stop sounds", command=e.stop_all).pack(side=tk.LEFT, padx=2)
         ttk.Button(row, text="📂 Open sounds folder", command=self._open_folder).pack(side=tk.LEFT, padx=(12, 2))
         ttk.Button(row, text="⟳ Reload", command=e.reload).pack(side=tk.LEFT, padx=2)
-        ttk.Label(sounds, foreground='gray', justify=tk.LEFT, text=(
+        ttk.Label(sounds, style='Hint.TLabel', justify=tk.LEFT, text=(
             "Put sound files in the sounds folder - the file name is the word (yee.wav -> yee). Sub-folders work too.\n"
             "A Sven ChatSounds list (chatsounds.txt, lines like: bleh twlz/bleh.wav) in that folder is read as well."
         )).pack(anchor=tk.W, padx=6, pady=(0, 6))
@@ -404,13 +422,13 @@ class SoundboardWindow:
         self.ffmpeg_row = ttk.Frame(self.win)
         self.ffmpeg_var = tk.StringVar()
         ttk.Label(self.ffmpeg_row, text="ffmpeg is needed to play sounds:").pack(side=tk.LEFT)
-        ttk.Label(self.ffmpeg_row, textvariable=self.ffmpeg_var, foreground='gray').pack(side=tk.LEFT, padx=6)
+        ttk.Label(self.ffmpeg_row, textvariable=self.ffmpeg_var, style='Hint.TLabel').pack(side=tk.LEFT, padx=6)
         if self._tools:
             self.ffmpeg_btn = ttk.Button(self.ffmpeg_row, text="Download ffmpeg", command=self._tools.update_ffmpeg)
             self.ffmpeg_btn.pack(side=tk.LEFT, padx=4)
 
         self.status_var = tk.StringVar()
-        ttk.Label(self.win, textvariable=self.status_var, foreground='gray').pack(fill=tk.X, padx=10, pady=(0, 8))
+        ttk.Label(self.win, textvariable=self.status_var, style='Hint.TLabel').pack(fill=tk.X, padx=10, pady=(0, 8))
         self._poll()
 
     def _spin(self, parent, var, low, high, step, save):
@@ -446,6 +464,12 @@ class SoundboardWindow:
             self.engine.set(key, value)
         except ValueError:
             var.set(str(self.engine.get(key)))
+
+    def _save_bass(self):
+        try:
+            self.engine.set('bass_db', max(-15, min(6, int(float(self.bass_var.get())))))
+        except ValueError:
+            self.bass_var.set(str(int(self.engine.get('bass_db'))))
 
     def _set_volume(self):
         value = int(float(self.volume_var.get()))
