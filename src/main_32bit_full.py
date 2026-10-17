@@ -185,6 +185,34 @@ NOT_CHAT = re.compile(r'^(?:(?:hostname|version|udp/ip|account|steamid|map|tags|
 # Only stripped from the start of the line, so they can't hide inside a name (e.g. "(TEAM)AdminName")
 CHAT_PREFIX = re.compile(r'^(?:\*DEAD\*|\*SPEC\*)?(?:\(TEAM\)|\(Spectator\))?(?<=[*)]) ')
 
+# Silent keys in tts.cfg ("echo Name : !stop") only reach the console log, and TF2 often writes that echo
+# scrambled: "Name !stop :", ": Name !stop", "!stop Name", or two presses on one line. A line made of nothing
+# but a name, colons and one of these commands counts as that command from that name - but only from an admin
+# (on_chat_message drops the rest). !admin add is deliberately not accepted scrambled.
+SILENT_COMMANDS = {'!stop': (), '!mute': (), '!approve': (), '!deny': (), '!skipsong': (), '!block': ('add', 'clear')}
+
+
+def silent_command(line):
+    """(name, command) for a silent-key line, scrambled or not, else None. Real chat ("Name :  text", two spaces
+    after the colon) never counts, and neither does a line with anything else on it (like a kill-feed message)."""
+    if ' :  ' in line:
+        return None
+    words = [w for w in line.split() if w != ':']
+    commands = {w.lower() for w in words if w.lower() in SILENT_COMMANDS}
+    if len(commands) != 1:
+        return None
+    command = commands.pop()
+    rest = [w for w in words if w.lower() != command]
+    if SILENT_COMMANDS[command]:
+        args = {w.lower() for w in rest if w.lower() in SILENT_COMMANDS[command]}
+        if len(args) != 1:
+            return None
+        arg = args.pop()
+        rest = [w for w in rest if w.lower() != arg]
+        command += ' ' + arg
+    name = ' '.join(dict.fromkeys(rest))  # two presses on one line repeat the name
+    return (name, command) if name else None
+
 # DECtalk markup: inline commands like [:np] [:phoneme on] [:t 430,500] [:dial 555], or phonemes with
 # timing like [dah<600,20>] / Moonbase-style [<500,20>]space. SAPI voices read these out as gibberish.
 # Command names are 2+ letters ([:np], [:rate 200]) or one letter plus numbers ([:t 430,500]), so smileys
@@ -232,6 +260,12 @@ class TF2LogMonitor(GameLogMonitor):
         if NOT_CHAT.match(line):
             return None
 
+        # A silent key from tts.cfg, possibly scrambled by TF2
+        silent = silent_command(line)
+        if silent:
+            return {'username': silent[0], 'message': silent[1], 'is_dead': False, 'is_team': False,
+                    'is_spec': False, 'silent': True, 'raw': line}
+
         # Debug logging for !block commands
         if "!block" in line.lower():
             logger.info("LOG PARSER: Found a !block line")
@@ -273,24 +307,25 @@ class TF2LogMonitor(GameLogMonitor):
         return None
         
     def monitor_loop(self):
-        """Monitor loop matching old system"""
+        """Read new lines from the game's console log as it grows. Only whole lines are read: a line the game is
+        still writing (no line break yet) waits for the next pass, so it's never cut in two."""
         while self.running:
             try:
                 if self.log_path and self.log_path.exists():
-                    with open(self.log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    with open(self.log_path, 'rb') as f:
                         f.seek(self.last_position)
-                        
-                        for line in f:
-                            parsed = self.parse_line(line)
-                            if parsed:
-                                for callback in self.callbacks:
-                                    try:
-                                        callback(parsed)
-                                    except Exception as e:
-                                        logger.error(f"Callback error: {e}")
-                                        
-                        self.last_position = f.tell()
-                        
+                        data = f.read()
+                    whole = data.rfind(b'\n') + 1
+                    self.last_position += whole
+                    for raw in data[:whole].splitlines():
+                        parsed = self.parse_line(raw.decode('utf-8', errors='ignore'))
+                        if parsed:
+                            for callback in self.callbacks:
+                                try:
+                                    callback(parsed)
+                                except Exception as e:
+                                    logger.error(f"Callback error: {e}")
+
             except Exception as e:
                 logger.error(f"Monitor error: {e}")
                 
@@ -2647,7 +2682,13 @@ OTHER
             
     def on_chat_message(self, msg):
         """Handle chat message"""
-        
+
+        # A silent key only counts from an admin. Anything else that happens to look like one (a player named
+        # "!stop" in some console line) is dropped before it shows up or does anything.
+        if msg.get('silent'):
+            if msg['username'] not in [self.admin_listbox.get(i) for i in range(self.admin_listbox.size())]:
+                return
+
         # Debug logging for all !block messages
         if "!block" in msg.get('message', '').lower():
             logger.info(f"ON_CHAT_MESSAGE: Received !block message from {msg.get('username', 'unknown')}")

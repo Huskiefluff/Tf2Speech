@@ -10,6 +10,11 @@ v1.1.1
 - DJ: YouTube songs play again. YouTube started refusing its audio links to anything but yt-dlp, so songs
   started and ended at once; yt-dlp now fetches the audio itself and hands it to ffmpeg. If a song can't be
   played, the DJ window says why (e.g. "This video is unavailable").
+- Silent keys (the "echo" versions in tts.cfg) work on the first press. TF2 often writes them scrambled
+  ("Name !stop :", "!stop Name"), so it could take 2-3 presses; TF2Speech now understands those - from admins
+  only. !admin add still has to come through exactly.
+- Chat lines are only read once TF2 has finished writing them, so a message is never cut in two and a command
+  is never handled twice.
 
 
 v1.1.0 - changes since v1.0.0

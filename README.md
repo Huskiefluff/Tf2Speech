@@ -376,6 +376,8 @@ DECtalk supports phoneme commands for songs and sound effects!
 - DECtalk songs cut off by TF2's chat length limit are sung (the unfinished last note is dropped) instead of read out as brackets and numbers
 - One note after a `[` - like `[dah<2000,24>]` - is enough for a message to count as DECtalk singing; a stray `[` or brackets around normal words don't count
 - DJ: YouTube songs play again - YouTube started refusing its audio links to anything but yt-dlp (songs started and ended at once), so yt-dlp now fetches the audio itself; if a song can't play, the DJ window says why
+- Silent keys (the `echo` versions in `tts.cfg`) work on the first press - TF2 often writes them scrambled, which TF2Speech now understands (from admins only; `!admin add` still has to come through exactly)
+- Chat lines are only read once TF2 has finished writing them, so a message is never cut in two and a command is never handled twice
 
 ---
 
