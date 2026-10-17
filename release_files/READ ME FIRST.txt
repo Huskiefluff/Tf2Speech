@@ -24,12 +24,12 @@ Your settings are saved in config.json next to the exe. The DJ, soundboard and P
 tools they need into this folder the first time you use them - nothing is installed in Windows.
 
 
-UPGRADING FROM v1.0.0
----------------------
+UPGRADING
+---------
 - Extract this zip over your old one (it's the same "release" folder) - your config.json stays and is used.
   Or copy config.json from your old folder into this one.
-- Copy the new tts.cfg into TF2's cfg folder again: it has new keys (mute, approve / deny / skip song) and
-  optional "silent" versions of the keys. If you changed your own copy, move your changes over.
+- Coming from v1.0.0: copy the new tts.cfg into TF2's cfg folder again: it has new keys (mute, approve / deny /
+  skip song) and optional "silent" versions of the keys. If you changed your own copy, move your changes over.
 
 
 "WINDOWS PROTECTED YOUR PC"

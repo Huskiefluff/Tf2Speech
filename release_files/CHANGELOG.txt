@@ -1,5 +1,16 @@
-TF2Speech v{version} - changes since v1.0.0
-=========================================
+TF2Speech v{version} - what's new
+==============================
+
+v1.1.1
+------
+- DECtalk songs cut off by TF2's chat length limit are sung (the unfinished last note is dropped) instead of
+  being read out as brackets and numbers
+- One note after a [ - like [dah<2000,24>] - is enough for a message to count as DECtalk singing, wherever the
+  note sits inside the brackets. A stray [ on its own or brackets around normal words still don't count.
+
+
+v1.1.0 - changes since v1.0.0
+=============================
 
 NEW
 ---
@@ -28,8 +39,6 @@ FIXES
 - Privacy: tts_tf2.log no longer contains what people say in chat - only how long a line was, the voice and
   the player's name - and it's capped at about 10 MB (tts_tf2.log plus the previous one as tts_tf2.log.1).
   You can delete an old tts_tf2.log from v1.0.0, which may contain chat.
-- DECtalk songs cut off by TF2's chat length limit are still sung (the unfinished last note is dropped)
-  instead of being read out as brackets and numbers
 - Muting or blocking someone cuts their current line off immediately (Windows voices too)
 - Admin commands still work for an admin who is muted
 - "Hide / Unhide Selected" really hides voices - from every voice list and from random voices
