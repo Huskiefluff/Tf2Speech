@@ -1,0 +1,87 @@
+TF2Speech v{version} - Voices
+==========================
+
+Every voice below shows up in all of TF2Speech's voice lists (default voice, /v voice commands, per-player
+voices, the DJ voice) as soon as it's available. Too many? Voice Commands tab -> select voices in the list of
+available voices -> "Hide / Unhide Selected". Hidden voices are left out of every list and never given out at
+random; select them and press it again to bring them back.
+
+
+WORKS OUT OF THE BOX
+====================
+
+DECtalk (built in)
+------------------
+Perfect Paul, Harry, Frank, Betty, Wendy, Dennis, Kit, Ursula and Rita - the Moonbase Alpha voices - with
+DECtalk's phoneme and singing commands ([:np], [dah<600,20>]...). Nothing to install. DECtalk commands sent with
+any other voice are spoken with DECtalk automatically.
+
+Windows voices (SAPI 5)
+-----------------------
+The voices that come with Windows (Microsoft David, Zira... depending on your Windows language).
+
+Any other SAPI 5 voice installed on the PC for 64-bit programs shows up too, e.g. voices you bought from
+IVONA, Cepstral, CereProc or NeoSpeech. Voices that were only installed for 32-bit programs don't show up,
+because TF2Speech is a 64-bit program.
+
+
+FREE EXTRAS - ONE CLICK IN THE VOICES TAB
+=========================================
+
+Windows' extra voices (no download)
+-----------------------------------
+Windows 10/11 can add more voices and languages: Windows Settings -> Time & language -> Speech -> Add voices.
+Windows keeps those apart from what normal programs can use, so after adding some, open TF2Speech's Voices tab
+and press "Make them usable here" (Windows asks for admin permission once), then restart TF2Speech.
+"Undo" removes them again. Many PCs already have one or two of these (e.g. Microsoft Mark).
+
+Piper voices (free download)
+----------------------------
+Natural-sounding neural voices in dozens of languages. They run on your PC - nothing you type is sent online.
+Voices tab -> "Download Piper (22 MB)" the first time -> pick a voice -> "Download" (20-130 MB each) -> "Test".
+They show up as  [Piper] <voice>,  e.g. [Piper] en_US-ryan-medium. Downloads come from the official Piper
+voice list and are checked against its checksums. Each voice has its own licence (see its MODEL_CARD).
+
+
+IF YOU HAVE THEM INSTALLED - NOT INCLUDED, AND TF2SPEECH CAN'T DOWNLOAD THEM
+============================================================================
+
+Classic SAPI 4 voices: Microsoft Sam 4.0, TruVoice (BonziBuddy) and other 90s voices
+------------------------------------------------------------------------------------
+What you need installed (works on 64-bit Windows 10/11):
+  - The Microsoft Speech API 4.0 runtime (spchapi.exe)
+  - The voices, for example:
+      "Microsoft Text-to-Speech Engine 4.0 (English)"
+          Sam, Mike and Mary, Mike / Mary in Hall, in Space, in Stadium and for Telephone,
+          RoboSoft One - Six, Male / Female Whisper
+      "Lernout & Hauspie TruVoice American English TTS Engine" (tv_enua.exe)
+          Adult Male #1 - #8, Adult Female #1 - #2
+These were free Microsoft Agent downloads; Microsoft no longer hosts them, and TF2Speech can't include them.
+Install them as administrator, then restart TF2Speech.
+
+Voices tab -> "Classic SAPI 4 voices" shows how many were found, with a Test button and a volume slider.
+They show up as  [SAPI4] <voice>,  e.g. [SAPI4] Sam or [SAPI4] Adult Male #1 (TruVoice), plus a ready-made
+
+    [SAPI4] Bonzi  =  TruVoice Adult Male #2 at BonziBuddy's pitch (140) and speed (157)
+
+which appears whenever TruVoice is installed. SAPI 4 voices are 32-bit only, so TF2Speech uses a small helper
+of its own (sapi4_tts.exe, built into the exe; source on GitHub, MIT). SAPI 4 codes typed in chat (like
+\Pau=9000\) are read out as text, not obeyed. Without SAPI 4, the Voices tab just says it isn't installed.
+
+TextAloud voices, e.g. Acapela "Will From Afar"
+-----------------------------------------------
+Some voices sold by NextUp for TextAloud only work inside TextAloud.
+What you need: TextAloud 3 (tested with 3.0.119), registered with your own licence, plus the voice installed
+for it. A "TextAloud" tab then appears in TF2Speech, and its voices show up as  [TextAloud] <voice>.
+
+TF2Speech runs TextAloud on a separate, hidden Windows desktop, so its window and error boxes never pop up over
+your game. If TextAloud crashes or freezes it's restarted and the line is tried again; if it keeps failing, its
+voices use your default voice for a few minutes. If you have TextAloud open yourself, TF2Speech uses that copy
+and leaves it open. Without TextAloud, the tab is hidden.
+
+
+ALL VOICES
+==========
+!stop, mutes, blocks, the output device and the DJ's music ducking work the same with every kind of voice. If a
+[Piper], [SAPI4] or [TextAloud] voice someone picked isn't available (uninstalled, removed, not working), that
+line is spoken in your default voice instead.

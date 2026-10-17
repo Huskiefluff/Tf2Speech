@@ -8,6 +8,7 @@ import sys
 import os
 import time
 import logging
+import logging.handlers
 import json
 import re
 import shutil
@@ -43,6 +44,8 @@ else:
     log_dir = Path.cwd()
 
 # Configure logging FIRST - in exe directory
+# Chat is never written to the log (only lengths, voices and names), and the log is capped at about 10 MB:
+# tts_tf2.log plus the previous one as tts_tf2.log.1
 log_file = log_dir / 'tts_tf2.log'
 # Console output only when there is a console (the windowed exe has none, so sys.stderr is None there)
 console_handlers = [logging.StreamHandler()] if sys.stderr else []
@@ -50,14 +53,14 @@ try:
     logging.basicConfig(
         level=logging.DEBUG,  # More verbose for debugging
         format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[logging.FileHandler(log_file)] + console_handlers
+        handlers=[logging.handlers.RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=1, encoding='utf-8')] + console_handlers
     )
 except Exception as e:
     # Fallback if can't create log in exe dir
     logging.basicConfig(
         level=logging.DEBUG,
         format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[logging.FileHandler('tts_tf2.log')] + console_handlers
+        handlers=[logging.handlers.RotatingFileHandler('tts_tf2.log', maxBytes=5_000_000, backupCount=1, encoding='utf-8')] + console_handlers
     )
 
 logger = logging.getLogger(__name__)
@@ -231,7 +234,7 @@ class TF2LogMonitor(GameLogMonitor):
 
         # Debug logging for !block commands
         if "!block" in line.lower():
-            logger.info(f"LOG PARSER: Found !block in line: '{line}'")
+            logger.info("LOG PARSER: Found a !block line")
             
         # Chat prefix in front of the name (spectators included, so blocks/admins/voices still match them)
         prefix_match = CHAT_PREFIX.match(line)
@@ -252,7 +255,7 @@ class TF2LogMonitor(GameLogMonitor):
                 
                 # Debug logging for parsed !block commands
                 if "!block" in message.lower():
-                    logger.info(f"LOG PARSER: Parsed !block command - user: '{username}', message: '{message}'")
+                    logger.info(f"LOG PARSER: Parsed !block command from '{username}'")
                 
                 return {
                     'username': username,
@@ -265,7 +268,7 @@ class TF2LogMonitor(GameLogMonitor):
         
         # Debug logging for unparsed !block lines
         if "!block" in line.lower():
-            logger.info(f"LOG PARSER: Failed to parse !block line: '{line}'")
+            logger.info("LOG PARSER: Failed to parse a !block line")
             
         return None
         
@@ -2647,8 +2650,7 @@ OTHER
         
         # Debug logging for all !block messages
         if "!block" in msg.get('message', '').lower():
-            logger.info(f"ON_CHAT_MESSAGE: Received !block message from {msg.get('username', 'unknown')}: '{msg.get('message', '')}'")
-            logger.info(f"ON_CHAT_MESSAGE: Full message dict: {msg}")
+            logger.info(f"ON_CHAT_MESSAGE: Received !block message from {msg.get('username', 'unknown')}")
         
         # Format and display
         timestamp = time.strftime("%H:%M:%S")
@@ -2946,7 +2948,7 @@ OTHER
             
             # Debug logging for DRG
             game_type = msg.get('game', 'unknown')
-            logger.info(f"Processing !tts command from {game_type}: '{text_to_speak}' by {msg['username']}")
+            logger.info(f"Processing !tts command from {game_type} by {msg['username']} ({len(text_to_speak)} chars)")
             
             # Check private mode - only admins can use !tts in private mode
             if self.private_mode_var.get():
@@ -3109,8 +3111,7 @@ OTHER
                 text = match.group(2) if match.group(2) else ""
                 cmd = f"v {voice_num}"
                 
-                logger.info(f"Voice command (with space): '{cmd}', Text: '{text}'")
-                logger.info(f"Text repr for debugging: {repr(text)}")  # Show exact string representation
+                logger.info(f"Voice command (with space): '{cmd}' ({len(text)} chars)")
                 
                 if cmd in self.voice_commands:
                     voice_name = self.voice_commands[cmd]
@@ -3138,7 +3139,7 @@ OTHER
                 trigger = match.group(1)
                 text = match.group(2) if match.group(2) else ""
                 
-                logger.info(f"Voice command trigger: '{trigger}', Text: '{text}'")
+                logger.info(f"Voice command trigger: '{trigger}' ({len(text)} chars)")
                 
                 # Check if we have this command mapped
                 if trigger in self.voice_commands:
@@ -3282,7 +3283,7 @@ OTHER
         """Queue text for speaking"""
         if self.audio_manager:
             # Add to queue with voice info and username
-            logger.info(f"Adding message to speech queue: '{text}' with voice '{voice_name}' from {username}")
+            logger.info(f"Adding message to speech queue ({len(text)} chars) with voice '{voice_name}' from {username}")
             self.message_queue.put({'text': text, 'voice': voice_name, 'username': username})
     
     def populate_longform_voice_combo(self):
@@ -3427,7 +3428,7 @@ OTHER
                                 logger.info("Set DECtalk audio to VoiceMeeter Input")
                             
                             # Speak with native DECtalk directly with volume control
-                            logger.info(f"Text being sent to DECtalk: '{text_to_speak}'")
+                            logger.info(f"Sending {len(text_to_speak)} chars to DECtalk")
                             dectalk_volume = self.dectalk_volume
                             success = self.dectalk_native.speak(text_to_speak, profile_name, use_wav=True, device_override=current_device, volume=dectalk_volume)
                             if success:

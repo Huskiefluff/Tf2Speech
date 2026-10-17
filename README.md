@@ -51,6 +51,8 @@ Nothing else needs installing. The DJ and soundboard use two free tools that TF2
 
 Your settings are saved in `config.json` next to the exe.
 
+The zip also has `VOICES.txt` (every kind of voice TF2Speech can use and what the optional ones need), `CHANGELOG.txt` and the licences of everything built into the exe (`THIRD-PARTY-NOTICES.txt`).
+
 ### Option B: Build From Source
 
 1. Clone the repository:
@@ -70,6 +72,8 @@ Your settings are saved in `config.json` next to the exe.
 3. Find the executable in `dist/`
 
 The small SAPI 4 helper `src/sapi4_tts.exe` comes ready-built. To rebuild it after changing `tools/sapi4_tts/sapi4_tts.cpp`, run `tools/sapi4_tts/build_sapi4_tts.bat` (needs the Visual Studio C++ build tools).
+
+To make a release zip after building: `python tools/make_release.py 1.1.0` (same Python that built the exe) - it adds `tts.cfg`, the notes in `release_files/` and the licence notices, and nothing personal from `dist\`.
 
 To run without building: `python src/main_32bit_simple.py`
 
@@ -363,7 +367,7 @@ DECtalk supports phoneme commands for songs and sound effects!
 - Click **Update yt-dlp** in the DJ window
 
 ### Something went wrong
-- Everything is logged to `tts_tf2.log` next to the exe
+- Everything is logged to `tts_tf2.log` next to the exe (never what people say in chat)
 
 ---
 
@@ -376,6 +380,7 @@ DECtalk supports phoneme commands for songs and sound effects!
 - **New:** DJ window (local music, Subsonic/Navidrome library, YouTube, queue, ducking, bass control, "now playing", chat song requests with spoken confirmations, approval and per-person limits)
 - **New:** Chat soundboard (Sven Co-op ChatSounds style)
 - **New:** Help tab rewritten to match the real commands
+- Privacy: `tts_tf2.log` no longer contains what people say in chat (only line lengths, voices and names) and is capped at about 10 MB
 - **Hide / Unhide Selected** really hides voices now - from every voice list and from random voices
 - Muting or blocking someone cuts their current line off immediately (Windows voices too)
 - Admin commands still work for an admin who is muted

@@ -284,7 +284,7 @@ class DECtalkNative:
                         return f'[{"".join(phonemes)}]'
                 
                 # Default: just pass through, DECtalk might handle it
-                logger.warning(f"No phoneme mapping for '{word}', passing through")
+                logger.warning("No phoneme mapping for a word, passing it through")
                 return f'[{word}<{duration},{pitch}>]'
             
             # Replace all Moonbase patterns
@@ -321,8 +321,7 @@ class DECtalkNative:
             else:
                 full_text = text
         
-        # Debug logging to see what text we're sending to DECtalk
-        logger.info(f"DECtalk full_text being sent: '{full_text}'")
+        logger.info(f"DECtalk: speaking {len(full_text)} chars")  # never the text itself: no chat in the log
         
         try:
             if use_wav:
@@ -346,7 +345,7 @@ class DECtalkNative:
         # Just pass the text which may contain DECtalk commands
         cmd.append(text)
         
-        logger.debug(f"DECtalk command: {' '.join(cmd)}")
+        logger.debug(f"DECtalk command: {cmd[0]} ({len(text)} chars)")
         
         # Run say.exe from its directory so it can find the dictionary
         dectalk_dir = Path(self.dectalk_path).parent
@@ -396,9 +395,7 @@ class DECtalkNative:
             # Just pass the text which may contain DECtalk commands
             cmd.append(text)
             
-            logger.debug(f"DECtalk WAV command: {' '.join(cmd)}")
-            logger.info(f"DECtalk text argument: {repr(text)}")  # Show exact string being passed
-            logger.info(f"DECtalk cmd list: {cmd}")  # Show command as list
+            logger.debug(f"DECtalk WAV command: {cmd[0]} -w {wav_path} ({len(text)} chars)")
             
             # Run say.exe to generate WAV from its directory so it can find the dictionary
             dectalk_dir = Path(self.dectalk_path).parent

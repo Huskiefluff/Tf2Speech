@@ -7,6 +7,7 @@ Minimal entry point that includes tkinter
 import sys
 import os
 import logging
+import logging.handlers
 from pathlib import Path
 import traceback
 
@@ -16,11 +17,13 @@ if getattr(sys, 'frozen', False):
 else:
     log_dir = Path.cwd()
 
+# Chat is never written to the log (only lengths, voices and names), and the log is capped at about 10 MB:
+# tts_tf2.log plus the previous one as tts_tf2.log.1
 log_file = log_dir / 'tts_tf2.log'
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler(log_file)]
+    handlers=[logging.handlers.RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=1, encoding='utf-8')]
     # Console output only when there is a console (the windowed exe has none, so sys.stderr is None there)
     + ([logging.StreamHandler()] if sys.stderr else [])
 )

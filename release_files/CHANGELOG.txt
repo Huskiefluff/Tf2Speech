@@ -1,0 +1,57 @@
+TF2Speech v{version} - changes since v1.0.0
+=========================================
+
+NEW
+---
+- DJ window: play music from your PC, your Subsonic/Navidrome library or YouTube into voice chat. Queue, music
+  gets quieter while a voice talks, loudness levelling, bass control, "now playing", a DJ voice, chat song
+  requests (!sr) with spoken confirmations, optional approval (!approve / !deny), a per-person limit, and
+  !skipsong for admins
+- Chat soundboard (Sven Co-op ChatSounds style): type a word like "yee" and everyone hears the sound
+- Voices tab: make Windows' extra voices usable (one admin prompt, with Undo) and download free Piper voices
+- Classic SAPI 4 voices (Microsoft Sam 4.0, TruVoice...) if they're installed, with a ready-made [SAPI4] Bonzi
+- Optional TextAloud voices (e.g. Acapela Will From Afar) - TextAloud runs hidden, crashes and freezes are handled
+- New look: flat Light / Dark / Match Windows, or the Classic look. Resizable sections with draggable dividers,
+  smooth resizing, tabs that scroll instead of being cut off, remembers its size and position, sharp at any
+  Windows scaling
+- Mutes: !mute [minutes] / !unmute, a MUTED panel and automatic muting of copy-paste spam
+- Multiple games: add, edit and remove any Source game (L4D2, GMod, CS:S...) with its own log file, admins and
+  block list
+- DECtalk auto-switch: DECtalk commands ([:np], [dah<600,20>]...) sent with another voice are spoken with DECtalk
+  instead of read out as gibberish
+- Help tab rewritten to match the real commands
+- tts.cfg: keys for mute, approve, deny and skip song, plus optional silent versions of the keys
+- No console window; start-up errors show in a pop-up
+
+FIXES
+-----
+- Privacy: tts_tf2.log no longer contains what people say in chat - only how long a line was, the voice and
+  the player's name - and it's capped at about 10 MB (tts_tf2.log plus the previous one as tts_tf2.log.1).
+  You can delete an old tts_tf2.log from v1.0.0, which may contain chat.
+- Muting or blocking someone cuts their current line off immediately (Windows voices too)
+- Admin commands still work for an admin who is muted
+- "Hide / Unhide Selected" really hides voices - from every voice list and from random voices
+- Drop-down lists follow the theme after switching it
+- Spectators (*SPEC*) are matched against blocks, mutes and voices
+- Status-command and material-error lines no longer clutter the chat window
+- Windows voices read text literally (no SAPI markup tricks like minutes of silence)
+- Each queued message keeps its own voice
+- Settings are saved safely: no half-written config.json, and a backup is kept and used if the config is damaged
+- "✓ Apply" saves everything on the Settings tab; Import / Export keep all settings; Import, Reset and Reload
+  really apply
+- !block never blocks the program's own speakers; a DECtalk default voice is honoured
+- DECtalk: the volume slider also applies to profile tests and goes up to 150%; output device matching skips
+  input devices
+- Old temp files from crashed runs are cleaned up automatically
+- No hard-coded default admin name
+- Removed the "Output to TF2 Chat" and "Test Audio" buttons, which didn't work
+- tts.cfg: voice_buffer_ms is 100 (lower made other players sound choppy for you)
+
+RELEASE
+-------
+- The download now includes the licences of everything built into the exe (THIRD-PARTY-NOTICES.txt) and notes
+  on every kind of voice (VOICES.txt)
+- Smaller exe: two unused libraries are no longer built in
+- ffmpeg, yt-dlp and Piper are downloaded on demand from their official sources - nothing extra is bundled or
+  installed
+- Building from the GitHub source now includes DECtalk's language files (they were missing from the repository)

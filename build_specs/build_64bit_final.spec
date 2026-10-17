@@ -67,11 +67,6 @@ a = Analysis(
         
         # Audio processing
         'numpy',
-        'scipy',
-        'scipy.signal',
-        'scipy.io',
-        'scipy.io.wavfile',
-        'sounddevice',
         'pyaudio',
         'wave',
         
@@ -147,6 +142,10 @@ a = Analysis(
         'requests',
         'urllib3',
         'certifi',
+        # not used by TF2Speech (and sounddevice's PortAudio comes with ASIO, which has its own licence)
+        'scipy',
+        'sounddevice',
+        '_sounddevice_data',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

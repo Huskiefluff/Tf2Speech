@@ -245,3 +245,9 @@ dist_backup_*/
 # SAPI 4 helper build leftovers (the finished helper is src/sapi4_tts.exe)
 tools/sapi4_tts/sapi4_tts.exe
 tools/sapi4_tts/*.obj
+
+# DECtalk keeps its language DLLs in lib folders, which the Python "lib/" rule above would hide
+!voice_data/dectalk/**/lib/
+
+# Release zips made by tools/make_release.py
+dist_release/

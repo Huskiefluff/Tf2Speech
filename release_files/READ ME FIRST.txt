@@ -1,0 +1,49 @@
+TF2Speech v{version}
+=================
+
+Text-to-speech for Team Fortress 2 (and other Source games) voice chat: DECtalk (Moonbase Alpha), Windows
+voices, free Piper voices and more, with a DJ, a chat soundboard, mutes and admin controls.
+
+Full guide, source code and help: https://github.com/Huskiefluff/Tf2Speech
+
+
+QUICK START
+-----------
+1. Install VoiceMeeter (free): https://vb-audio.com/Voicemeeter/  - it carries the TTS into your microphone.
+2. Extract this folder anywhere, e.g. C:\TF2Speech, and run TTS_TF2_64BIT.exe.
+3. Audio Devices tab: pick "VoiceMeeter Input".
+   Settings tab: set Game Log File to TF2's log, e.g.
+     C:\Program Files (x86)\Steam\steamapps\common\Team Fortress 2\tf\log.txt
+   then press "✓ Apply".
+4. Copy tts.cfg into TF2's cfg folder (...\Team Fortress 2\tf\cfg\) and add this line to autoexec.cfg there:
+     exec tts.cfg
+5. Route VoiceMeeter to your ears and to the virtual mic, and pick "VoiceMeeter Output" as TF2's microphone.
+   Step by step: see "Setup Guide" in the full guide (link above).
+
+Your settings are saved in config.json next to the exe. The DJ, soundboard and Piper voices download the free
+tools they need into this folder the first time you use them - nothing is installed in Windows.
+
+
+UPGRADING FROM v1.0.0
+---------------------
+- Extract this zip over your old one (it's the same "release" folder) - your config.json stays and is used.
+  Or copy config.json from your old folder into this one.
+- Copy the new tts.cfg into TF2's cfg folder again: it has new keys (mute, approve / deny / skip song) and
+  optional "silent" versions of the keys. If you changed your own copy, move your changes over.
+
+
+"WINDOWS PROTECTED YOUR PC"
+---------------------------
+The exe isn't code-signed (that costs money every year), so Windows SmartScreen may warn the first time:
+click "More info" -> "Run anyway". Programs built with PyInstaller are also flagged by some antivirus programs
+by mistake now and then. The full source code is on GitHub, and build.bat builds the same exe yourself.
+
+
+IN THIS FOLDER
+--------------
+TTS_TF2_64BIT.exe          the program
+tts.cfg                    TF2 config: log file, voice loopback and keys for !stop, !mute, blocks, DJ songs
+VOICES.txt                 every kind of voice TF2Speech can use, and what the optional ones need
+CHANGELOG.txt              what's new and fixed in v{version}
+LICENSE.txt                TF2Speech's licence (MIT)
+THIRD-PARTY-NOTICES.txt    licences of the parts built into the exe (Python, DECtalk, numpy...)
