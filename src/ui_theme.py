@@ -1,9 +1,13 @@
 """
 Look and layout helpers for the TTS windows
 
-- Windows 11 style (Sun Valley ttk theme, MIT) in Light, Dark or "match Windows", with dark title bars
+- A flat modern look (Light, Dark or "match Windows") drawn by Tk itself - fast to redraw - or the Classic look,
+  with matching Windows title bars
 - Sharp text at 125%/150% Windows scaling, and window/dialog sizes that scale with it
 - ScrollFrame: a tab or panel that scrolls when the window is too small for it, instead of cutting it off
+
+(The Sun Valley theme was tried first, but it draws every control from semi-transparent pictures, which Tk on
+Windows redraws very slowly: ~140 ms per tab hover and over a second per resize step on the TTS window.)
 """
 
 import os
@@ -11,21 +15,21 @@ import sys
 import ctypes
 import logging
 import tkinter as tk
-from tkinter import ttk
-
-try:
-    import sv_ttk
-except Exception:  # the app still works with the plain look
-    sv_ttk = None
+from tkinter import ttk, font as tkfont
 
 logger = logging.getLogger(__name__)
 
-# Colours that go with the Sun Valley theme, for the classic Tk widgets it doesn't style itself
 PALETTE = {
-    'light': {'bg': '#fafafa', 'field': '#ffffff', 'fg': '#1c1c1c', 'border': '#d9d9d9', 'hint': '#6b6b6b',
-              'select': '#2f60d8', 'selectfg': '#ffffff', 'good': '#d9f2df', 'sash': '#e5e5e5'},
-    'dark': {'bg': '#1c1c1c', 'field': '#2b2b2b', 'fg': '#fafafa', 'border': '#3a3a3a', 'hint': '#a0a0a0',
-             'select': '#2f60d8', 'selectfg': '#ffffff', 'good': '#1f4d2b', 'sash': '#2b2b2b'},
+    'light': {'bg': '#f3f3f3', 'field': '#ffffff', 'fg': '#1b1b1b', 'border': '#cfcfcf', 'hint': '#666666',
+              'select': '#0067c0', 'selectfg': '#ffffff', 'good': '#d9f2df', 'sash': '#e2e2e2',
+              'btn': '#fdfdfd', 'btn_hover': '#ededed', 'btn_press': '#e0e0e0',
+              'accent': '#0067c0', 'accent_hover': '#1975c5', 'accent_fg': '#ffffff',
+              'tab': '#e6e6e6', 'tab_hover': '#ececec', 'disabled': '#a0a0a0'},
+    'dark': {'bg': '#202020', 'field': '#2b2b2b', 'fg': '#f2f2f2', 'border': '#3d3d3d', 'hint': '#a3a3a3',
+             'select': '#0a64c8', 'selectfg': '#ffffff', 'good': '#1f4d2b', 'sash': '#2a2a2a',
+             'btn': '#2d2d2d', 'btn_hover': '#383838', 'btn_press': '#444444',
+             'accent': '#4cc2ff', 'accent_hover': '#6dcfff', 'accent_fg': '#000000',
+             'tab': '#272727', 'tab_hover': '#303030', 'disabled': '#6b6b6b'},
     # the original look: Tk's plain grey 'default' theme with Arial headings
     'classic': {'bg': '#d9d9d9', 'field': '#ffffff', 'fg': '#000000', 'border': '#a0a0a0', 'hint': '#555555',
                 'select': '#0078d7', 'selectfg': '#ffffff', 'good': '#90ee90', 'sash': '#c8c8c8'},
@@ -132,6 +136,29 @@ def colors():
     return PALETTE[_current['mode']]
 
 
+def fast_resize(root):
+    """Stop Windows repainting every control each time the window changes size. Tk registers its windows as
+    "redraw everything on resize" (CS_HREDRAW | CS_VREDRAW), so dragging the TTS window's edge made all ~110
+    visible controls repaint on every step (~110 ms each, i.e. stutter). Controls whose size really changes still
+    redraw themselves, so nothing is lost. Applies to Tk's two window classes for this program only."""
+    if sys.platform != 'win32':
+        return
+    try:
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        user32.GetClassLongPtrW.restype = ctypes.c_size_t
+        user32.GetClassLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.SetClassLongPtrW.restype = ctypes.c_size_t
+        user32.SetClassLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_size_t]
+        root.update_idletasks()
+        for hwnd in (user32.GetParent(root.winfo_id()), root.winfo_id()):  # TkTopLevel frame, TkChild windows
+            if hwnd:
+                style = user32.GetClassLongPtrW(hwnd, -26)  # GCL_STYLE
+                user32.SetClassLongPtrW(hwnd, -26, style & ~0x0003)
+    except Exception as e:
+        logger.debug(f"fast_resize not applied: {e}")
+
+
 def _title_bar(win, dark):
     """Dark/light Windows title bar to match (Windows 10 2004+ / 11)"""
     if sys.platform != 'win32':
@@ -152,14 +179,15 @@ def _title_bar(win, dark):
 def _recolor(widget):
     """Classic Tk widgets: fields get the field shade, everything else the window colour"""
     c = colors()
+    classic = _current['mode'] == 'classic'
     try:
         cls = widget.winfo_class()
         if cls in CLASSIC_FIELDS:
-            classic = _current['mode'] == 'classic'
             widget.configure(background=c['field'], foreground=c['fg'], selectbackground=c['select'],
                              selectforeground=c['selectfg'], highlightthickness=0 if classic else 1,
                              highlightbackground=c['border'], highlightcolor=c['select'],
-                             relief=tk.SUNKEN if classic else tk.FLAT, borderwidth=1 if classic else 0)
+                             relief=tk.SUNKEN if classic else tk.FLAT, borderwidth=1 if classic else 0,
+                             font=('TkDefaultFont' if cls == 'Listbox' else 'TkFixedFont') if classic else 'TTSBody')
             if cls == 'Text':
                 widget.configure(insertbackground=c['fg'])
         elif cls == 'Canvas':
@@ -174,102 +202,141 @@ def _recolor(widget):
         _recolor(child)
 
 
-_font_base = {}
+_FONTS = {}  # tkinter deletes a named font when its Font object is garbage-collected, so keep them
 
 
-def _scale_fonts(root):
-    """Sun Valley's fonts are fixed pixel sizes (14 px body text), so on a 150% screen they'd stay tiny while
-    everything else grows. Scale them like Windows scales normal text."""
-    from tkinter import font
-    s = scale_of(root)
-    for name in font.names(root):
-        if not name.startswith('SunValley'):
-            continue
-        f = font.nametofont(name, root=root)
-        size = int(f.cget('size'))
-        base = _font_base.setdefault(name, size)  # remember the original so repeated calls don't compound
-        if base < 0:  # negative = pixels
-            f.configure(size=-int(round(-base * s)))
-
-
-def _compact_tabs(root, style, mode, s):
-    """Sun Valley's tab headers have 16 px of padding on each side built into their image element - too wide
-    for the TTS's nine tabs. Same images, slimmer sides."""
-    if sv_ttk is None:
-        return
-    ns = 'sv_dark' if mode == 'dark' else 'sv_light'
-    try:
-        rest, selected, hover = (root.tk.eval(f'set ttk::theme::{ns}::I({name})')
-                                 for name in ('tab-rest', 'tab-selected', 'tab-hover'))
-        if 'Compact.Notebook.tab' not in style.element_names():  # elements belong to the current theme
-            style.element_create('Compact.Notebook.tab', 'image', rest, ('selected', selected), ('active', hover),
-                                 border=13, padding=(int(9 * s), 14, int(9 * s), 6), height=32)
-        style.layout('TNotebook.Tab', [('Compact.Notebook.tab', {'sticky': 'nswe', 'children': [
-            ('Notebook.padding', {'side': 'top', 'sticky': 'nswe', 'children': [
-                ('Notebook.focus', {'side': 'top', 'sticky': 'nswe', 'children': [
-                    ('Notebook.label', {'side': 'top', 'sticky': ''})]})]})]})])
-    except tk.TclError as e:
-        logger.debug(f"Compact tabs not available: {e}")
-
-
-def apply_theme(root, choice='system'):
-    """Switch every window to Light/Dark ('system' follows Windows) or the original Classic look. Safe to call
-    again to change it."""
-    mode = resolve_mode(choice)
-    if mode != 'classic' and sv_ttk is None:
-        mode = 'classic'  # the modern theme isn't available
-    _current['mode'] = mode
-    c = colors()
-    if mode == 'classic':
-        return _apply_classic(root, c)
-    if sv_ttk is not None:
+def _recolor_popdowns(root, c, font):
+    """A combobox's drop-down list is made by Tk the first time it opens, so it isn't one of the program's own
+    widgets and _recolor never sees it - after switching look it kept the old colours (e.g. grey with white text)"""
+    stack = ['.']
+    while stack:
+        path = stack.pop()
         try:
-            sv_ttk.set_theme(mode, root)
-        except Exception as e:
-            logger.warning(f"Theme not available ({e}) - using the plain look")
-    style = ttk.Style(root)
-    _scale_fonts(root)
-    body = 'SunValleyBodyFont' if sv_ttk is not None else 'TkDefaultFont'
-    strong = 'SunValleyBodyStrongFont' if sv_ttk is not None else ('TkDefaultFont', 10, 'bold')
-    style.configure('Section.TLabel', font=strong)
-    style.configure('Title.TLabel', font='SunValleySubtitleFont' if sv_ttk is not None else ('TkDefaultFont', 12, 'bold'))
-    style.configure('Hint.TLabel', foreground=c['hint'])
-    s = scale_of(root)
-    _compact_tabs(root, style, mode, s)
-    # Small buttons for the list panel on the right
-    style.configure('Compact.TButton', padding=(int(6 * s), int(1 * s), int(6 * s), int(2 * s)))
-    # New classic widgets (dialogs, the DJ/Soundboard windows) pick these up when they're created
+            stack.extend(root.tk.splitlist(root.tk.call('winfo', 'children', path)))
+            if root.tk.call('winfo', 'class', path) != 'TCombobox':
+                continue
+            listbox = f'{path}.popdown.f.l'
+            if int(root.tk.call('winfo', 'exists', listbox)):
+                root.tk.call(listbox, 'configure', '-background', c['field'], '-foreground', c['fg'],
+                             '-selectbackground', c['select'], '-selectforeground', c['selectfg'], '-font', font)
+        except tk.TclError:
+            pass
+
+
+def _fonts(root):
+    """Named fonts for the flat look (in points, so they grow with Windows scaling)"""
+    have = set(tkfont.names(root))
+    for name, family, size in (('TTSBody', 'Segoe UI', 10), ('TTSStrong', 'Segoe UI Semibold', 10),
+                               ('TTSTitle', 'Segoe UI Semibold', 13), ('TTSSmall', 'Segoe UI', 9)):
+        if name not in have:
+            _FONTS[name] = tkfont.Font(root=root, name=name, family=family, size=size)
+
+
+def _option_db(root, c, body, text_font, classic):
+    """New classic widgets (dialogs, the DJ/Soundboard windows, combobox drop-downs) pick these up"""
     for cls in CLASSIC_FIELDS:
         root.option_add(f'*{cls}.background', c['field'], 'interactive')
         root.option_add(f'*{cls}.foreground', c['fg'], 'interactive')
         root.option_add(f'*{cls}.selectBackground', c['select'], 'interactive')
         root.option_add(f'*{cls}.selectForeground', c['selectfg'], 'interactive')
-        root.option_add(f'*{cls}.highlightThickness', 1, 'interactive')
+        root.option_add(f'*{cls}.highlightThickness', 0 if classic else 1, 'interactive')
         root.option_add(f'*{cls}.highlightBackground', c['border'], 'interactive')
-        root.option_add(f'*{cls}.relief', 'flat', 'interactive')
-        root.option_add(f'*{cls}.borderWidth', 0, 'interactive')
-        root.option_add(f'*{cls}.font', body, 'interactive')
+        root.option_add(f'*{cls}.relief', 'sunken' if classic else 'flat', 'interactive')
+        root.option_add(f'*{cls}.borderWidth', 1 if classic else 0, 'interactive')
+    root.option_add('*Listbox.font', body, 'interactive')
+    root.option_add('*Text.font', text_font, 'interactive')
     root.option_add('*Text.insertBackground', c['fg'], 'interactive')
     root.option_add('*Canvas.background', c['bg'], 'interactive')
     root.option_add('*Canvas.highlightThickness', 0, 'interactive')
-    # Dialogs and other windows get a matching title bar as they open
-    root.bind_class('Toplevel', '<Map>', lambda e: _title_bar(e.widget, mode == 'dark') if e.widget.winfo_class() == 'Toplevel' else None, add='')
-    _title_bar(root, mode == 'dark')
-    _recolor(root)
-    if sv_ttk is not None:
-        _refont(root)
-    root.after(60, lambda: _recolor(root))  # once more after the theme's own <<ThemeChanged>> recolouring
-    for top in root.winfo_children():
-        if isinstance(top, tk.Toplevel):
-            _title_bar(top, mode == 'dark')
-    return mode
+    root.option_add('*TCombobox*Listbox.background', c['field'], 'interactive')
+    root.option_add('*TCombobox*Listbox.foreground', c['fg'], 'interactive')
+    root.option_add('*TCombobox*Listbox.selectBackground', c['select'], 'interactive')
+    root.option_add('*TCombobox*Listbox.selectForeground', c['selectfg'], 'interactive')
 
 
-def _apply_classic(root, c):
-    """The original look: Tk's plain grey theme, Arial headings, white sunken lists - the new resizable layout"""
+def _flat_theme(root, c):
+    """The modern look: Tk's 'clam' theme, flattened and recoloured. Everything is drawn as plain shapes, so
+    hovering and resizing redraw quickly."""
+    style = ttk.Style(root)
+    style.theme_use('clam')
+    bg, field, fg, border = c['bg'], c['field'], c['fg'], c['border']
+    style.configure('.', background=bg, foreground=fg, fieldbackground=field, bordercolor=border,
+                    lightcolor=bg, darkcolor=bg, troughcolor=c['field'], selectbackground=c['select'],
+                    selectforeground=c['selectfg'], insertcolor=fg, arrowcolor=fg, focuscolor=c['accent'],
+                    font='TTSBody', relief='flat')
+    style.map('.', foreground=[('disabled', c['disabled'])])
+    flat = lambda colour: {'background': colour, 'lightcolor': colour, 'darkcolor': colour}
+    # buttons
+    style.configure('TButton', padding=(10, 4), bordercolor=border, focusthickness=0, **flat(c['btn']))
+    style.map('TButton', background=[('disabled', bg), ('pressed', c['btn_press']), ('active', c['btn_hover'])],
+              lightcolor=[('disabled', bg), ('pressed', c['btn_press']), ('active', c['btn_hover'])],
+              darkcolor=[('disabled', bg), ('pressed', c['btn_press']), ('active', c['btn_hover'])],
+              bordercolor=[('focus', c['accent'])])
+    style.configure('Accent.TButton', foreground=c['accent_fg'], bordercolor=c['accent'], **flat(c['accent']))
+    style.map('Accent.TButton',
+              background=[('disabled', bg), ('pressed', c['accent_hover']), ('active', c['accent_hover'])],
+              lightcolor=[('disabled', bg), ('pressed', c['accent_hover']), ('active', c['accent_hover'])],
+              darkcolor=[('disabled', bg), ('pressed', c['accent_hover']), ('active', c['accent_hover'])],
+              foreground=[('disabled', c['disabled'])])
+    style.configure('Compact.TButton', padding=(6, 2), width=-4)  # no 11-character minimum width
+    # text fields
+    for name in ('TEntry', 'TCombobox', 'TSpinbox'):
+        style.configure(name, padding=(6, 3), bordercolor=border, fieldbackground=field, foreground=fg,
+                        lightcolor=field, darkcolor=field, background=c['btn'], arrowcolor=fg)
+        style.map(name, bordercolor=[('focus', c['accent'])], lightcolor=[('focus', field)],
+                  fieldbackground=[('readonly', field), ('disabled', bg)])
+    style.map('TCombobox', selectbackground=[('readonly', field)], selectforeground=[('readonly', fg)],
+              background=[('active', c['btn_hover'])])
+    # check boxes and radio buttons
+    for name in ('TCheckbutton', 'TRadiobutton'):
+        style.configure(name, background=bg, foreground=fg, indicatorbackground=field, indicatorforeground=fg,
+                        upperbordercolor=border, lowerbordercolor=border, focuscolor=bg)
+        style.map(name, background=[('active', bg)],
+                  indicatorbackground=[('selected', c['accent']), ('pressed', c['btn_press'])],
+                  indicatorforeground=[('selected', c['accent_fg'])])
+    # tabs
+    style.configure('TNotebook', background=bg, bordercolor=border, lightcolor=bg, darkcolor=bg,
+                    tabmargins=(0, 2, 0, 0))
+    style.configure('TNotebook.Tab', padding=(9, 4), font='TTSSmall', bordercolor=border, foreground=c['hint'],
+                    **flat(c['tab']))
+    style.map('TNotebook.Tab', background=[('selected', bg), ('active', c['tab_hover'])],
+              lightcolor=[('selected', bg), ('active', c['tab_hover'])],
+              darkcolor=[('selected', bg), ('active', c['tab_hover'])],
+              foreground=[('selected', fg), ('active', fg)])
+    # lists and tables
+    rowheight = tkfont.nametofont('TTSBody', root=root).metrics('linespace') + 6
+    style.configure('Treeview', background=field, fieldbackground=field, foreground=fg, bordercolor=border,
+                    lightcolor=field, darkcolor=field, rowheight=rowheight)
+    style.map('Treeview', background=[('selected', c['select'])], foreground=[('selected', c['selectfg'])])
+    style.configure('Treeview.Heading', relief='flat', foreground=fg, bordercolor=border, **flat(c['btn']))
+    style.map('Treeview.Heading', background=[('active', c['btn_hover'])], lightcolor=[('active', c['btn_hover'])],
+              darkcolor=[('active', c['btn_hover'])])
+    # scrollbars, sliders, frames
+    for name in ('Vertical.TScrollbar', 'Horizontal.TScrollbar'):
+        style.configure(name, troughcolor=bg, bordercolor=bg, arrowcolor=c['hint'], gripcount=0, **flat(c['btn']))
+        style.map(name, background=[('active', c['btn_hover'])], lightcolor=[('active', c['btn_hover'])],
+                  darkcolor=[('active', c['btn_hover'])])
+    for name in ('Horizontal.TScale', 'Vertical.TScale'):
+        style.configure(name, troughcolor=field, bordercolor=border, **flat(c['btn']))
+        style.map(name, background=[('active', c['btn_hover'])])
+    style.configure('TLabelframe', background=bg, bordercolor=border, lightcolor=bg, darkcolor=bg)
+    style.configure('TLabelframe.Label', background=bg, foreground=c['hint'], font='TTSSmall')
+    style.configure('TSeparator', background=border)
+    style.configure('TProgressbar', background=c['accent'], troughcolor=field, bordercolor=border,
+                    lightcolor=c['accent'], darkcolor=c['accent'])
+    style.configure('Sash', sashthickness=5, background=bg)
+    style.configure('Section.TLabel', font='TTSStrong')
+    style.configure('Title.TLabel', font='TTSTitle')
+    style.configure('Hint.TLabel', foreground=c['hint'])
+    root.tk_setPalette(background=bg, foreground=fg, activeBackground=c['btn_hover'], activeForeground=fg,
+                       highlightColor=c['accent'], selectBackground=c['select'], selectForeground=c['selectfg'],
+                       insertBackground=fg, troughColor=field)
+
+
+def _classic_theme(root, c):
+    """The original look: Tk's plain grey theme, Arial headings, white sunken lists"""
     style = ttk.Style(root)
     style.theme_use('default')
-    # undo the modern theme's colours on the classic widgets (it set them with tk_setPalette)
     root.tk_setPalette(background=c['bg'], foreground=c['fg'], activeBackground='#ececec',
                        activeForeground=c['fg'], highlightColor='#000000', selectBackground=c['select'],
                        selectForeground=c['selectfg'])
@@ -277,41 +344,33 @@ def _apply_classic(root, c):
     style.configure('Title.TLabel', font=('Arial', 12, 'bold'))
     style.configure('Hint.TLabel', foreground=c['hint'])
     style.configure('Compact.TButton', padding=(2, 1))
-    for cls, font in (('Listbox', 'TkDefaultFont'), ('Text', 'TkFixedFont')):
-        root.option_add(f'*{cls}.background', c['field'], 'interactive')
-        root.option_add(f'*{cls}.foreground', c['fg'], 'interactive')
-        root.option_add(f'*{cls}.selectBackground', c['select'], 'interactive')
-        root.option_add(f'*{cls}.selectForeground', c['selectfg'], 'interactive')
-        root.option_add(f'*{cls}.highlightThickness', 0, 'interactive')
-        root.option_add(f'*{cls}.relief', 'sunken', 'interactive')
-        root.option_add(f'*{cls}.borderWidth', 1, 'interactive')
-        root.option_add(f'*{cls}.font', font, 'interactive')
-    root.option_add('*Text.insertBackground', c['fg'], 'interactive')
-    root.option_add('*Canvas.background', c['bg'], 'interactive')
-    root.bind_class('Toplevel', '<Map>', lambda e: _title_bar(e.widget, False) if e.widget.winfo_class() == 'Toplevel' else None, add='')
-    _title_bar(root, False)
+
+
+def apply_theme(root, choice='system'):
+    """Switch every window to Light/Dark ('system' follows Windows) or the original Classic look. Safe to call
+    again to change it. Returns 'light', 'dark' or 'classic'."""
+    mode = resolve_mode(choice)
+    _current['mode'] = mode
+    c = colors()
+    _fonts(root)
+    classic = mode == 'classic'
+    if classic:
+        _classic_theme(root, c)
+        _option_db(root, c, 'TkDefaultFont', 'TkFixedFont', True)
+    else:
+        _flat_theme(root, c)
+        _option_db(root, c, 'TTSBody', 'TTSBody', False)
+    dark = mode == 'dark'
+    # Dialogs and other windows get a matching title bar as they open
+    root.bind_class('Toplevel', '<Map>',
+                    lambda e: _title_bar(e.widget, dark) if e.widget.winfo_class() == 'Toplevel' else None, add='')
+    _title_bar(root, dark)
     _recolor(root)
-    root.after(60, lambda: _recolor(root))
-    _refont(root)
+    _recolor_popdowns(root, c, 'TkDefaultFont' if classic else 'TTSBody')
     for top in root.winfo_children():
         if isinstance(top, tk.Toplevel):
-            _title_bar(top, False)
-    return 'classic'
-
-
-def _refont(widget):
-    """Lists and text boxes already open take the font of the current look"""
-    classic = _current['mode'] == 'classic'
-    try:
-        cls = widget.winfo_class()
-        if cls == 'Listbox':
-            widget.configure(font='TkDefaultFont' if classic else 'SunValleyBodyFont')
-        elif cls == 'Text':
-            widget.configure(font='TkFixedFont' if classic else 'SunValleyBodyFont')
-    except tk.TclError:
-        pass
-    for child in widget.winfo_children():
-        _refont(child)
+            _title_bar(top, dark)
+    return mode
 
 
 # ---------------------------------------------------------------- scrolling

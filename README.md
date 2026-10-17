@@ -1,6 +1,6 @@
 # TF2Speech
 
-Text-to-Speech for Team Fortress 2 using DECtalk and Windows SAPI5 voices.
+Text-to-Speech for Team Fortress 2 using DECtalk, Windows voices and free Piper voices.
 
 A spiritual successor to the original TF2Speech program, allowing players to communicate via text-to-speech through in-game voice chat.
 
@@ -23,8 +23,9 @@ A spiritual successor to the original TF2Speech program, allowing players to com
 - **DJ** *(new)* - Play music from your PC, your Subsonic/Navidrome library or YouTube into voice chat, with a queue, ducking under TTS and chat song requests (with optional approval)
 - **Soundboard** *(new)* - Sven Co-op style chat sounds: type `yee`, everyone hears it
 - **More voices** *(new)* - Make Windows' extra voices usable, and download free natural-sounding [Piper](https://github.com/rhasspy/piper) voices in dozens of languages with one click
+- **Classic SAPI 4 voices** *(new, optional)* - If the old SAPI 4 voices are installed on your PC (Microsoft Sam 4.0, L&H TruVoice...), they work too - including a ready-made BonziBuddy voice
 - **TextAloud voices** *(new, optional)* - If you own TextAloud 3 voices (e.g. Acapela Will From Afar), TF2Speech can use them through TextAloud, completely hidden
-- **Modern look** *(new)* - Windows 11 style with Light / Dark / Match Windows, or the Classic look; every part resizes, tabs scroll instead of getting cut off, sharp at any Windows scaling
+- **New look** *(new)* - A flat Light / Dark / Match Windows look, or the Classic look; every part resizes smoothly, tabs scroll instead of getting cut off, sharp at any Windows scaling
 
 ---
 
@@ -67,6 +68,8 @@ Your settings are saved in `config.json` next to the exe.
    ```
 
 3. Find the executable in `dist/`
+
+The small SAPI 4 helper `src/sapi4_tts.exe` comes ready-built. To rebuild it after changing `tools/sapi4_tts/sapi4_tts.cpp`, run `tools/sapi4_tts/build_sapi4_tts.bat` (needs the Visual Studio C++ build tools).
 
 To run without building: `python src/main_32bit_simple.py`
 
@@ -176,7 +179,9 @@ The `!tts` prefix can be changed per game in the Settings tab.
 **DECtalk voices (included):**
 - Perfect Paul, Harry, Frank, Betty, Wendy, Dennis, Kit, Ursula, Rita
 
-**More voices:** see [Voices](#voices) - Windows' extra voices and free Piper voices show up in every voice list as `[Piper] ...`.
+**More voices:** see [Voices](#voices) - Windows' extra voices, free Piper voices (`[Piper] ...`) and classic SAPI 4 voices (`[SAPI4] ...`) show up in every voice list.
+
+**Hiding voices:** in the Voice Commands tab, select voices in the list of available voices and press **Hide / Unhide Selected**. Hidden voices are marked *(hidden)* there, left out of every other voice list and never given out at random. Select them and press it again to bring them back.
 
 **Configuring Voice Commands:**
 1. Open TF2Speech → Voice Commands tab
@@ -264,6 +269,14 @@ The **Voices** tab gets you more voices:
 - **Windows voices** - Windows can add voices and languages (Settings → Time & language → Speech → Add voices). Windows keeps those apart from the voices programs like TF2Speech can use, so after adding some press **Make them usable here** - Windows asks for admin permission once - and restart TF2Speech. **Undo** removes them again. Many PCs already have a few of these (e.g. Microsoft Mark).
 - **Free voices (Piper)** - natural-sounding neural voices that run on your PC, in dozens of languages. Pick one, press **Download** (20-130 MB each; the small Piper program is fetched the first time) and **Test**. They appear in every voice list as `[Piper] en_US-ryan-medium` and work like the other voices - `!stop`, mutes, the output device and the music ducking all apply. Downloads are checked against the voice list's checksums.
 
+### Classic SAPI 4 voices (optional)
+
+The old SAPI 4 voices from the late 90s - Microsoft Sam / Mike / Mary 4.0 and their variants, Lernout & Hauspie TruVoice (BonziBuddy's voice) and others - work too, if they are installed on your PC. They appear in every voice list as `[SAPI4] ...`, plus a ready-made **`[SAPI4] Bonzi`** (TruVoice Adult Male #2 at BonziBuddy's pitch and speed). The **Voices** tab shows what was found and has a **Test** button and a volume slider.
+
+You need the Microsoft SAPI 4.0 runtime (`spchapi.exe`) and the voice packages (for example `tv_enua.exe` for TruVoice) installed. These used to be free Microsoft Agent downloads; Microsoft no longer hosts them, and TF2Speech doesn't include or download them. Without SAPI 4 the Voices tab just says it isn't installed.
+
+SAPI 4 voices are 32-bit only, so TF2Speech uses a small 32-bit helper of its own (`sapi4_tts.exe`, source in [tools/sapi4_tts](tools/sapi4_tts), MIT) that says each line into a sound file, which plays like DECtalk - `!stop`, mutes, the output device and the music ducking all apply. SAPI 4 codes typed in chat (like `\Pau=...\`) are read out as text, not obeyed.
+
 ### TextAloud voices (optional)
 
 Some voices sold for TextAloud 3 (for example Acapela "Will From Afar" bought from NextUp) only run inside TextAloud. If TextAloud 3 is installed, a **TextAloud** tab appears: TF2Speech asks TextAloud to say each line into a sound file and plays it like DECtalk. TextAloud runs on a separate hidden Windows desktop, so its window and any error boxes never appear over your game; if it crashes or freezes it is restarted, and the line falls back to your default voice if needed. Nothing from TextAloud is included - you need your own licensed copy. Without TextAloud this is all invisible.
@@ -272,7 +285,7 @@ Some voices sold for TextAloud 3 (for example Acapela "Will From Afar" bought fr
 
 ## Appearance
 
-**Settings → Appearance**: Match Windows, Light, Dark (Windows 11 style) or Classic (the original grey look). Drag the dividers between the chat log, the speak box, the tabs and the lists to resize them; a tab that doesn't fit scrolls. The window remembers its size, position and dividers.
+**Settings → Appearance**: Match Windows, Light, Dark (a flat modern look) or Classic (the original grey look). Drag the dividers between the chat log, the speak box, the tabs and the lists to resize them; a tab that doesn't fit scrolls. The window remembers its size, position and dividers.
 
 ---
 
@@ -286,8 +299,6 @@ The DJ, soundboard and Piper voices need a few free tools. They are **not** incl
 | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | finding YouTube audio | the official yt-dlp release | Unlicense |
 | [Piper](https://github.com/rhasspy/piper) | free voices | the official Piper release (~22 MB) | MIT |
 | [Piper voices](https://huggingface.co/rhasspy/piper-voices) | free voices | the official Piper voice list | each voice's own licence (see its MODEL_CARD) |
-
-The Windows 11 look uses the [Sun Valley ttk theme](https://github.com/rdbende/Sun-Valley-ttk-theme) (MIT), which is built into the exe.
 
 If FFmpeg is already installed on your PC (e.g. `winget install ffmpeg`), TF2Speech uses that instead. YouTube changes break yt-dlp now and then - the **Update yt-dlp** button fixes that.
 
@@ -358,12 +369,14 @@ DECtalk supports phoneme commands for songs and sound effects!
 
 ## What's new in v1.1.0
 
-- **New:** Windows 11 look (Light / Dark / Match Windows) or Classic; resizable sections, scrolling tabs, remembers its size, sharp at any Windows scaling
+- **New:** flat Light / Dark / Match Windows look or Classic; resizable sections, smooth resizing, scrolling tabs, remembers its size, sharp at any Windows scaling
 - **New:** Voices tab - make Windows' extra voices usable, download free Piper voices
+- **New:** optional classic SAPI 4 voices (Microsoft Sam 4.0, TruVoice...) with a ready-made `[SAPI4] Bonzi`
 - **New:** optional TextAloud voices (e.g. Acapela Will From Afar), with TextAloud hidden away and crash-proofed
 - **New:** DJ window (local music, Subsonic/Navidrome library, YouTube, queue, ducking, bass control, "now playing", chat song requests with spoken confirmations, approval and per-person limits)
 - **New:** Chat soundboard (Sven Co-op ChatSounds style)
 - **New:** Help tab rewritten to match the real commands
+- **Hide / Unhide Selected** really hides voices now - from every voice list and from random voices
 - Muting or blocking someone cuts their current line off immediately (Windows voices too)
 - Admin commands still work for an admin who is muted
 - **New:** Mutes (`!mute` / `!unmute`), MUTED panel and automatic spam muting
@@ -391,7 +404,6 @@ DECtalk supports phoneme commands for songs and sound effects!
 - **Sven Co-op ChatSounds** - Inspiration for the soundboard
 - **FFmpeg** and **yt-dlp** - Downloaded on demand for the DJ and soundboard
 - **Piper** by the Rhasspy project - Free neural voices, downloaded on demand
-- **Sun Valley ttk theme** by rdbende - The Windows 11 look
 
 ---
 
@@ -400,6 +412,7 @@ DECtalk supports phoneme commands for songs and sound effects!
 - DECtalk binaries are sourced from the [dectalk GitHub repository](https://github.com/dectalk/dectalk), originally shared by developer Edward Bruckert in 2015
 - SAPI5 voices are property of Microsoft and included with Windows; TF2Speech doesn't distribute any voices
 - FFmpeg (LGPL), yt-dlp (Unlicense), Piper (MIT) and Piper voices are not distributed with TF2Speech; they are downloaded from their official sources on request
+- SAPI 4 (Microsoft) and SAPI 4 voices (Microsoft, Lernout & Hauspie) are not included; TF2Speech's own helper only uses voices already installed on your PC
 - TextAloud and voices bought for it are not included; TF2Speech only talks to a copy you installed and licensed yourself, through TextAloud's own automation interface
 - This project is not affiliated with Valve or Team Fortress 2
 

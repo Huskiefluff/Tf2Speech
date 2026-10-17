@@ -29,6 +29,9 @@ datas = [
     # DECtalk extended voices from GitHub
     (str(project_root / 'voice_data' / 'dectalk' / 'extended'), 'dectalk/extended'),
     
+    # 32-bit helper that speaks with old SAPI 4 voices (built from tools/sapi4_tts)
+    (str(project_root / 'src' / 'sapi4_tts.exe'), '.'),
+
     # Create empty temp directory
     (str(project_root / 'voice_data' / 'temp'), 'temp'),
     
@@ -111,9 +114,9 @@ a = Analysis(
         'dj_player',  # DJ window (music + YouTube via ffmpeg/yt-dlp)
         'soundboard',  # chat soundboard (Sven ChatSounds style)
         'textaloud_voice',  # TextAloud voices (Will From Afar) via TextAloud's automation interface
-        'ui_theme',  # Windows 11 look (Sun Valley theme), dark mode, scaling, scrolling tabs
-        'sv_ttk',
+        'ui_theme',  # flat Light/Dark and Classic looks, scaling, scrolling tabs, smooth resizing
         'voice_installer',  # Voices tab: Windows' extra voices, free Piper voices
+        'sapi4_voice',  # old SAPI 4 voices (Sam 4.0, TruVoice/BonziBuddy) via sapi4_tts.exe
         'urllib.request',
         'array',
     ],

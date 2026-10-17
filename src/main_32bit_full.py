@@ -110,10 +110,20 @@ except Exception as e:
     PIPER_PREFIX = "[Piper] "
 
 
+try:
+    import sapi4_voice  # old SAPI 4 voices: Microsoft Sam 4.0, TruVoice (BonziBuddy)...
+    from sapi4_voice import PREFIX as SAPI4_PREFIX
+    SAPI4_AVAILABLE = True
+except Exception as e:
+    logger.warning(f"SAPI 4 voices not available: {e}")
+    SAPI4_AVAILABLE = False
+    SAPI4_PREFIX = "[SAPI4] "
+
+
 def is_special_voice(name):
     """DECtalk, TextAloud and Piper voices are played by the speech thread itself, not by the Windows voice worker"""
     return bool(name) and (name.startswith("[DECtalk] ") or name.startswith(TEXTALOUD_PREFIX)
-                           or name.startswith(PIPER_PREFIX))
+                           or name.startswith(PIPER_PREFIX) or name.startswith(SAPI4_PREFIX))
 
 # Try to import DECtalk native with fallback
 try:
@@ -403,6 +413,9 @@ class TTSReplicaWASAPI:
         self.voices_dir = Path(self.config.get('voices_dir') or self.get_config_path().parent / 'voices')
         self.piper = voice_installer.PiperVoices(self.voices_dir) if VOICES_AVAILABLE else None
         self.piper_volume = float(self.config.get('piper_volume', 1.0))
+        # Old SAPI 4 voices (Microsoft Sam 4.0, TruVoice/BonziBuddy...) if SAPI 4 is installed on this PC
+        self.sapi4 = sapi4_voice.Sapi4Voices() if SAPI4_AVAILABLE else None
+        self.sapi4_volume = float(self.config.get('sapi4_volume', 1.0))
 
         # Now initialize audio AFTER all required attributes are set
         self.init_audio()
@@ -424,6 +437,13 @@ class TTSReplicaWASAPI:
         self.refresh_muted_list()
         self.root.after(30000, self.tick_mutes)
         self.root.after(100, self.pump_ui_calls)
+
+        # Old SAPI 4 voices: ask the helper which are installed, then add them to the voice lists
+        if self.sapi4 and self.sapi4.available():
+            def find_sapi4():
+                self.sapi4.refresh()
+                self.run_on_gui(self.on_sapi4_voices)
+            threading.Thread(target=find_sapi4, daemon=True).start()
 
         # First run with TextAloud installed: find its voices once (later runs use the saved list)
         if self.textaloud_enabled and 'textaloud_voices' not in self.config:
@@ -1015,7 +1035,7 @@ class TTSReplicaWASAPI:
             'voices': ['default_voice', 'hidden_voices', 'dectalk_profiles', 'dectalk_volume', 'dectalk_enabled',
                        'random_voice_enabled', 'random_voice_exclusions', 'voice_toggle_command',
                        'textaloud_enabled', 'textaloud_volume', 'textaloud_voices', 'textaloud_idle_minutes',
-                       'piper_volume'],
+                       'piper_volume', 'sapi4_volume'],
             'voice_commands': ['voice_commands'],
             'user_voices': ['user_voice_preferences'],
             'announcements': ['announcements', 'announcement_enabled', 'announcement_voice'],
@@ -1197,6 +1217,7 @@ class TTSReplicaWASAPI:
         self.random_voice_exclusions = self.config.get('random_voice_exclusions', [])
         self.voice_toggle_command = self.config.get('voice_toggle_command', '/vt')
         self.dectalk_profiles = self.config.get('dectalk_profiles') or self.get_default_dectalk_profiles()
+        self.hidden_voices = self.load_hidden_voices()
         self.dectalk_enabled = self.config.get('dectalk_enabled', True)
 
         # Refresh the widgets that show these (load_settings handles the rest)
@@ -1333,16 +1354,17 @@ class TTSReplicaWASAPI:
         # Add SAPI voices from voice_commands
         for cmd, voice_name in self.voice_commands.items():
             if voice_name and voice_name.strip():
-                if voice_name not in self.random_voice_exclusions:
+                if voice_name not in self.random_voice_exclusions and voice_name not in self.hidden_voices:
                     available_voices.append(voice_name)
         
         # Add DECtalk voices (if not excluded)
         if hasattr(self, 'dectalk_profiles') and self.dectalk_profiles:
             for profile_name in self.dectalk_profiles.keys():
                 dectalk_voice = f"[DECtalk] {profile_name}"
-                if dectalk_voice not in self.random_voice_exclusions:
+                if dectalk_voice not in self.random_voice_exclusions and dectalk_voice not in self.hidden_voices:
                     available_voices.append(dectalk_voice)
-        available_voices += [v for v in self.extra_voice_names() if v not in self.random_voice_exclusions]
+        available_voices += [v for v in self.extra_voice_names()
+                             if v not in self.random_voice_exclusions and v not in self.hidden_voices]
 
         if not available_voices:
             logger.warning("No voices available for random assignment (all excluded?)")
@@ -1372,21 +1394,31 @@ class TTSReplicaWASAPI:
         dividers to change the split), the lists on the right share theirs, and a tab that doesn't fit scrolls
         instead of being cut off. Size, position and divider positions are remembered."""
         ui_theme.enable_dpi_awareness()
+        self.hidden_voices = self.load_hidden_voices()
         self.root = tk.Tk()
         self.root.title("TTS_GUI - WASAPI Enhanced")
         ui_theme.apply_forced_scale(self.root)
         self.ui_scale = ui_theme.scale_of(self.root)
         self.ui_mode = ui_theme.apply_theme(self.root, self.config.get('ui_theme', 'system'))
+        ui_theme.fast_resize(self.root)
         self.restore_window_size()
         px = self.px
 
+        # Everything sits in one frame that takes the window's new size once you pause dragging its edge.
+        # Re-laying out and redrawing every control on each pixel of the drag is what made resizing stutter.
+        self.content = ttk.Frame(self.root)
+        self.content.place(x=0, y=0, relwidth=1, relheight=1)
+        self._resize_job = None
+        self._content_size = None
+        self.root.bind_class('Tk', '<Configure>', self._on_window_configure)  # the main window only
+
         # Left: the main area in resizable sections | right: the lists (drag the divider to widen them)
-        self.side_paned = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, sashwidth=px(6), bd=0,
+        self.side_paned = tk.PanedWindow(self.content, orient=tk.HORIZONTAL, sashwidth=px(6), bd=0,
                                          sashrelief=tk.FLAT, opaqueresize=True)
         self.side_paned.pack(fill=tk.BOTH, expand=True, padx=px(6), pady=px(6))
         self.main_paned = tk.PanedWindow(self.side_paned, orient=tk.VERTICAL, sashwidth=px(6), bd=0,
                                          sashrelief=tk.FLAT, opaqueresize=True)
-        right_frame = ttk.Frame(self.side_paned)
+        right_frame = self.right_frame = ttk.Frame(self.side_paned)
         self.side_paned.add(self.main_paned, stretch='always', minsize=px(540))
         self.side_paned.add(right_frame, stretch='never', minsize=px(240))
 
@@ -1530,6 +1562,20 @@ class TTSReplicaWASAPI:
         ui_theme.apply_theme(self.root, self.config.get('ui_theme', 'system'))  # colour everything just built
         self.root.after(300, self.restore_dividers)  # once the window has its final size
 
+    def _on_window_configure(self, event):
+        if event.widget is not self.root or (event.width, event.height) == self._content_size:
+            return
+        if self._resize_job:
+            self.root.after_cancel(self._resize_job)
+        self._resize_job = self.root.after(150, self._apply_content_size)
+
+    def _apply_content_size(self):
+        """The window stopped changing size: lay everything out once for the new size"""
+        self._resize_job = None
+        width, height = self.root.winfo_width(), self.root.winfo_height()
+        self._content_size = (width, height)
+        self.content.place_configure(relwidth=0, relheight=0, width=width, height=height)
+
     def side_list(self, parent, row, title, buttons, weight=1):
         """One list on the right: title, the list (shares the height with the others, scrolls) and its buttons.
         Returns (listbox, next free grid row)."""
@@ -1590,6 +1636,12 @@ class TTSReplicaWASAPI:
             short = need - self.speak_frame.winfo_height()
             if short > 0:
                 self.main_paned.sash_place(1, 0, self.main_paned.sash_coord(1)[1] + short)
+            # the list panel on the right: at least as wide as its widest row of buttons
+            need = self.right_frame.winfo_reqwidth()
+            self.side_paned.paneconfigure(self.right_frame, minsize=need)
+            short = need - self.right_frame.winfo_width()
+            if short > 0:
+                self.side_paned.sash_place(0, self.side_paned.sash_coord(0)[0] - short, 0)
         except (tk.TclError, AttributeError):
             pass
 
@@ -1875,7 +1927,7 @@ class TTSReplicaWASAPI:
         scrollbar.config(command=self.available_voices_listbox.yview)
         
         # Hidden voices tracking
-        self.hidden_voices = self.config.get('hidden_voices', [])
+        self.hidden_voices = self.load_hidden_voices()
         
         # Populate voice list
         self.refresh_available_voices()
@@ -1884,7 +1936,7 @@ class TTSReplicaWASAPI:
         mgmt_frame = ttk.Frame(right_frame)
         mgmt_frame.pack(pady=5)
         
-        ttk.Button(mgmt_frame, text="Hide Selected", command=self.hide_selected_voices).pack(side=tk.LEFT, padx=2)
+        ttk.Button(mgmt_frame, text="Hide / Unhide Selected", command=self.hide_selected_voices).pack(side=tk.LEFT, padx=2)
         ttk.Button(mgmt_frame, text="Show All", command=self.show_all_voices).pack(side=tk.LEFT, padx=2)
         ttk.Button(mgmt_frame, text="Check Duplicates", command=self.check_duplicate_voices).pack(side=tk.LEFT, padx=2)
         
@@ -2093,6 +2145,31 @@ class TTSReplicaWASAPI:
         self.windows_voice_label = ttk.Label(win, wraplength=px(760), justify=tk.LEFT)
         self.windows_voice_label.pack(anchor='w', pady=(px(6), 0))
 
+        sf = ttk.LabelFrame(tab, text="Classic SAPI 4 voices (Microsoft Sam 4.0, TruVoice / BonziBuddy...)", padding=px(8))
+        sf.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(sf, wraplength=px(760), justify=tk.LEFT, style='Hint.TLabel', text=(
+            "Old SAPI 4 voices installed on this PC show up in every voice list as [SAPI4] ..., with a ready-made "
+            "[SAPI4] Bonzi (TruVoice Adult Male #2 at BonziBuddy's pitch and speed). They need the SAPI 4 runtime "
+            "(spchapi.exe) and the voice packages installed - none are included.")).pack(anchor='w')
+        row = ttk.Frame(sf)
+        row.pack(fill=tk.X, pady=(px(6), 0))
+        self.sapi4_status = ttk.Label(row, text="Looking for SAPI 4 voices..." if self.sapi4 and self.sapi4.available()
+                                      else "SAPI 4 isn't installed on this PC.")
+        self.sapi4_status.pack(side=tk.LEFT)
+        row = ttk.Frame(sf)
+        row.pack(fill=tk.X, pady=(px(6), 0))
+        self.sapi4_test_var = tk.StringVar()
+        self.sapi4_test_combo = ttk.Combobox(row, textvariable=self.sapi4_test_var, state='readonly', width=34)
+        self.sapi4_test_combo.pack(side=tk.LEFT)
+        ttk.Button(row, text="Test", command=self.test_sapi4_voice).pack(side=tk.LEFT, padx=px(6))
+        ttk.Label(row, text="Volume:").pack(side=tk.LEFT, padx=(px(16), px(4)))
+        self.sapi4_volume_var = tk.DoubleVar(value=self.sapi4_volume)
+        ttk.Scale(row, from_=0.0, to=1.5, variable=self.sapi4_volume_var, orient=tk.HORIZONTAL,
+                  length=px(160)).pack(side=tk.LEFT)
+        self.sapi4_volume_label = ttk.Label(row, text=f"{int(self.sapi4_volume * 100)}%")
+        self.sapi4_volume_label.pack(side=tk.LEFT, padx=px(4))
+        self.sapi4_volume_var.trace('w', self.update_sapi4_volume_label)
+
         pf = ttk.LabelFrame(tab, text="Free voices (Piper)", padding=px(8))
         pf.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         ttk.Label(pf, wraplength=px(760), justify=tk.LEFT, style='Hint.TLabel', text=(
@@ -2149,6 +2226,44 @@ class TTSReplicaWASAPI:
         self.refresh_windows_voice_label()
         self.refresh_piper_engine_label()
         self.load_piper_catalog(refresh=False)
+
+    # SAPI 4 voices
+    def on_sapi4_voices(self):
+        names = list(self.sapi4.voices) if self.sapi4 else []
+        if hasattr(self, 'sapi4_status'):
+            truvoice = sum(1 for n in names if n.endswith('(TruVoice)'))
+            self.sapi4_status.config(text=(f"{len(names)} SAPI 4 voices found ({truvoice} TruVoice)"
+                                           + (" - [SAPI4] Bonzi is ready" if 'Bonzi' in names else "")) if names
+                                      else "SAPI 4 is installed, but no SAPI 4 voices were found.")
+            self.sapi4_test_combo['values'] = names
+            if names and not self.sapi4_test_var.get():
+                self.sapi4_test_var.set(names[0])
+        self.refresh_all_voice_lists()
+
+    def test_sapi4_voice(self):
+        name = self.sapi4_test_var.get()
+        if not (self.sapi4 and name in self.sapi4.voices):
+            return
+
+        def work():
+            from temp_utils import get_temp_file, release_temp_file
+            wav = get_temp_file(suffix='.wav', prefix='tts_sapi4_')
+            try:
+                line = "Hi there! I'm Bonzi Buddy." if name == 'Bonzi' else f"Hello, this is {name.split(' (')[0]}."
+                if self.sapi4.render(line, name, wav):
+                    self.dectalk_native._play_wav(wav, self.config.get('audio_device', 'Default'), self.sapi4_volume)
+            finally:
+                release_temp_file(wav)
+        threading.Thread(target=work, daemon=True).start()
+
+    def update_sapi4_volume_label(self, *args):
+        volume = self.sapi4_volume_var.get()
+        self.sapi4_volume_label.config(text=f"{int(volume * 100)}%")
+        self.sapi4_volume = volume
+        self.config['sapi4_volume'] = volume
+        if getattr(self, '_volume_save_job', None):
+            self.root.after_cancel(self._volume_save_job)
+        self._volume_save_job = self.root.after(500, self.save_config)
 
     # Windows voices
     def refresh_windows_voice_label(self):
@@ -2410,6 +2525,8 @@ The keys write a line into the log as if you had typed it, without anything appe
 Change the name in tts.cfg (echo YourName : !stop) to your own Steam name.
 
 OTHER
+  Voices tab: Windows' extra voices, free Piper voices, and old SAPI 4 voices (Sam 4.0, TruVoice -
+    [SAPI4] Bonzi) if SAPI 4 is installed.
   Long-form box: longer text or DECtalk songs, spoken in the voice you pick next to it.
   Quick Speak: try a line out loud. Apply saves the Settings tab.
   Announcements tab: what the TTS says when someone is blocked, muted, requests a song...
@@ -3180,8 +3297,9 @@ OTHER
         # Add DECtalk profiles if available
         if self.dectalk_enabled and self.dectalk_profiles:
             for profile_name in sorted(self.dectalk_profiles.keys()):
-                voice_list.append(f"[DECtalk] {profile_name}")
-        voice_list += self.extra_voice_names()
+                if f"[DECtalk] {profile_name}" not in self.hidden_voices:
+                    voice_list.append(f"[DECtalk] {profile_name}")
+        voice_list += [v for v in self.extra_voice_names() if v not in self.hidden_voices]
 
         # Update combo box
         self.longform_voice_combo['values'] = voice_list
@@ -3336,6 +3454,14 @@ OTHER
                         else:
                             logger.warning("DECtalk not available, falling back to SAPI5")
                             self.audio_manager.speak(text_to_speak, use_sync=False, tag=msg.get('username'))
+                    elif current_voice and current_voice.startswith(SAPI4_PREFIX):
+                        logger.info(f"Using SAPI 4 voice: {current_voice}")
+                        if self.speak_sapi4(text_to_speak, current_voice, msg.get('username')):
+                            used_special_voice = True
+                        else:
+                            logger.warning("SAPI 4 voice unavailable, using the default voice")
+                            self.apply_default_voice()
+                            self.audio_manager.speak(text_to_speak, use_sync=False, tag=msg.get('username'))
                     elif current_voice and current_voice.startswith(PIPER_PREFIX):
                         logger.info(f"Using Piper voice: {current_voice}")
                         if self.speak_piper(text_to_speak, current_voice, msg.get('username')):
@@ -3426,6 +3552,8 @@ OTHER
         names = self.textaloud_voice_names()
         if getattr(self, 'piper', None):
             names += self.piper.voice_names()
+        if getattr(self, 'sapi4', None):
+            names += self.sapi4.voice_names()
         return names
 
     def textaloud_voice_names(self):
@@ -3497,6 +3625,29 @@ OTHER
         if getattr(self, '_volume_save_job', None):
             self.root.after_cancel(self._volume_save_job)
         self._volume_save_job = self.root.after(500, self.save_config)
+
+    def speak_sapi4(self, text, voice_name, username):
+        """Speak one message in an old SAPI 4 voice: the 32-bit helper writes a WAV, which plays like DECtalk"""
+        from temp_utils import get_temp_file, release_temp_file
+        player = getattr(self, 'dectalk_native', None)
+        if not (self.sapi4 and hasattr(player, '_play_wav')):
+            return False
+        wav_path = get_temp_file(suffix='.wav', prefix='tts_sapi4_')
+        player.stop_requested = False
+
+        def stopped():
+            return player.stop_requested or self.currently_speaking_user != username
+        try:
+            if not self.sapi4.render(text, voice_name[len(SAPI4_PREFIX):], wav_path, should_stop=stopped):
+                return stopped()  # cut off by !stop or a mute: not a failure
+            if not stopped():
+                player._play_wav(wav_path, self.config.get('audio_device', 'Default'), self.sapi4_volume)
+            return True
+        except Exception as e:
+            logger.error(f"SAPI 4 voice '{voice_name}' failed: {e}")
+            return False
+        finally:
+            release_temp_file(wav_path)
 
     def speak_piper(self, text, voice_name, username):
         """Speak one message in a Piper voice: Piper writes a WAV, which plays like DECtalk (same output device,
@@ -4029,13 +4180,14 @@ OTHER
         username = simpledialog.askstring("User Voice", "Enter username:")
         if username:
             # Show voice selection dialog
-            voice_names = [v.name for v in self.voices if v.name]
+            voice_names = [v.name for v in self.voices if v.name and v.name not in self.hidden_voices]
             
             # Add DECtalk voices if enabled
             if self.dectalk_enabled and self.dectalk_profiles:
                 for profile_name in self.dectalk_profiles.keys():
-                    voice_names.append(f"[DECtalk] {profile_name}")
-            voice_names += self.extra_voice_names()
+                    if f"[DECtalk] {profile_name}" not in self.hidden_voices:
+                        voice_names.append(f"[DECtalk] {profile_name}")
+            voice_names += [v for v in self.extra_voice_names() if v not in self.hidden_voices]
             
             from tkinter import messagebox
             # Create custom dialog for voice selection
@@ -4079,13 +4231,14 @@ OTHER
             username = entry.split(':')[0].strip()
             
             # Show voice selection dialog
-            voice_names = [v.name for v in self.voices if v.name]
+            voice_names = [v.name for v in self.voices if v.name and v.name not in self.hidden_voices]
             
             # Add DECtalk voices if enabled
             if self.dectalk_enabled and self.dectalk_profiles:
                 for profile_name in self.dectalk_profiles.keys():
-                    voice_names.append(f"[DECtalk] {profile_name}")
-            voice_names += self.extra_voice_names()
+                    if f"[DECtalk] {profile_name}" not in self.hidden_voices:
+                        voice_names.append(f"[DECtalk] {profile_name}")
+            voice_names += [v for v in self.extra_voice_names() if v not in self.hidden_voices]
             
             dialog = tk.Toplevel(self.root)
             dialog.title("Edit Voice")
@@ -4182,8 +4335,9 @@ OTHER
         if hasattr(self, 'dectalk_native') and self.dectalk_native.is_available():
             dectalk_profiles = self.dectalk_native.get_available_profiles()
             for profile in dectalk_profiles:
-                voice_names.append(f"[DECtalk] {profile}")
-        voice_names += self.extra_voice_names()
+                if f"[DECtalk] {profile}" not in self.hidden_voices:
+                    voice_names.append(f"[DECtalk] {profile}")
+        voice_names += [v for v in self.extra_voice_names() if v not in self.hidden_voices]
         
         
         # Update default voice combo
@@ -4379,71 +4533,95 @@ OTHER
             except Exception as e:
                 messagebox.showerror("Import Failed", str(e))
     
+    HIDDEN_MARK = " (hidden)"
+
+    def load_hidden_voices(self):
+        """The hidden-voices list from config. DECtalk voices used to be saved without their "[DECtalk] " prefix,
+        so hiding them never worked - those entries are fixed up here."""
+        hidden = list(self.config.get('hidden_voices', []))
+        profiles = getattr(self, 'dectalk_profiles', None) or self.config.get('dectalk_profiles') or {}
+        windows = {v.name for v in (getattr(self, 'voices', None) or [])}
+        fixed = []
+        for name in hidden:
+            if name in profiles and name not in windows and not name.startswith('['):
+                name = f"[DECtalk] {name}"
+            if name not in fixed:
+                fixed.append(name)
+        if fixed != hidden:
+            self.config['hidden_voices'] = fixed
+        return fixed
+
+    def refresh_all_voice_lists(self):
+        self.refresh_available_voices()
+        self.refresh_voice_combos()
+        if hasattr(self, 'longform_voice_combo'):
+            self.populate_longform_voice_combo()
+
     def refresh_available_voices(self):
-        """Refresh the available voices list"""
+        """Every voice, hidden ones marked "(hidden)" - hidden voices are left out of all the voice pickers and
+        are never given to new players at random. Voice commands that use one still work."""
         if not hasattr(self, 'available_voices_listbox'):
             return
-            
+
         self.available_voices_listbox.delete(0, tk.END)
-        
+        hidden_colour = ui_theme.colors()['hint']
+
+        def add(text, name):
+            hidden = name in self.hidden_voices
+            self.available_voices_listbox.insert(tk.END, text + (self.HIDDEN_MARK if hidden else ""))
+            if hidden:
+                self.available_voices_listbox.itemconfigure(tk.END, foreground=hidden_colour)
+
         # Track seen voices for duplicate detection
         seen_voices = {}
-        
-        # Add SAPI5 voices
         for i, voice in enumerate(self.voices):
-            # Check if voice is hidden
-            if voice.name not in self.hidden_voices:
-                # Check for duplicates
-                display_name = voice.name
-                if voice.name in seen_voices:
-                    display_name = f"{voice.name} (duplicate #{seen_voices[voice.name] + 1})"
-                    seen_voices[voice.name] += 1
-                else:
-                    seen_voices[voice.name] = 1
-                    
-                self.available_voices_listbox.insert(tk.END, f"[{i}] {display_name}")
-        
-        # Add DECtalk voices if enabled
+            display_name = voice.name
+            if voice.name in seen_voices:
+                display_name = f"{voice.name} (duplicate #{seen_voices[voice.name] + 1})"
+                seen_voices[voice.name] += 1
+            else:
+                seen_voices[voice.name] = 1
+            add(f"[{i}] {display_name}", voice.name)
         if self.dectalk_enabled and self.dectalk_profiles:
             for profile_name in self.dectalk_profiles.keys():
-                self.available_voices_listbox.insert(tk.END, f"[DECtalk] {profile_name}")
+                add(f"[DECtalk] {profile_name}", f"[DECtalk] {profile_name}")
         for name in self.extra_voice_names():
-            self.available_voices_listbox.insert(tk.END, name)
-        
-            
+            add(name, name)
+
+    def voice_name_from_row(self, text):
+        """'[3] Microsoft Sam (hidden)' -> 'Microsoft Sam'; '[DECtalk] Betty' stays '[DECtalk] Betty'"""
+        if text.endswith(self.HIDDEN_MARK):
+            text = text[:-len(self.HIDDEN_MARK)]
+        if ' (duplicate #' in text:
+            text = text.split(' (duplicate #')[0]
+        return re.sub(r'^\[\d+\] ', '', text)
+
     def hide_selected_voices(self):
-        """Hide selected voices from the list"""
+        """Hide the selected voices - or, if they're all hidden already, show them again"""
         selected = self.available_voices_listbox.curselection()
-        if selected:
-            for idx in selected:
-                voice_text = self.available_voices_listbox.get(idx)
-                # Extract voice name (remove index prefix)
-                voice_name = voice_text.split('] ', 1)[1] if '] ' in voice_text else voice_text
-                # Remove duplicate marker if present
-                if ' (duplicate #' in voice_name:
-                    voice_name = voice_name.split(' (duplicate #')[0]
-                    
-                if voice_name not in self.hidden_voices:
-                    self.hidden_voices.append(voice_name)
-            
-            # Save to config
-            self.config['hidden_voices'] = self.hidden_voices
-            self.save_config()
-            
-            # Refresh lists
-            self.refresh_available_voices()
-            self.refresh_voice_combos()
-            messagebox.showinfo("Hidden", f"Hidden {len(selected)} voice(s)")
-            
+        if not selected:
+            messagebox.showinfo("Voices", "Select one or more voices in the list first.", parent=self.root)
+            return
+        names = [self.voice_name_from_row(self.available_voices_listbox.get(i)) for i in selected]
+        unhide = all(n in self.hidden_voices for n in names)
+        for name in names:
+            if unhide:
+                self.hidden_voices.remove(name)
+            elif name not in self.hidden_voices:
+                self.hidden_voices.append(name)
+        self.config['hidden_voices'] = self.hidden_voices
+        self.save_config()
+        self.refresh_all_voice_lists()
+        messagebox.showinfo("Voices", f"{'Showing' if unhide else 'Hid'} {len(names)} voice(s).", parent=self.root)
+
     def show_all_voices(self):
         """Show all voices"""
         self.hidden_voices = []
         self.config['hidden_voices'] = []
         self.save_config()
-        self.refresh_available_voices()
-        self.refresh_voice_combos()
+        self.refresh_all_voice_lists()
         messagebox.showinfo("Shown", "All voices are now visible")
-        
+
     def check_duplicate_voices(self):
         """Check for duplicate voices and show report"""
         duplicates = {}
@@ -4549,9 +4727,11 @@ OTHER
             voice_listbox.insert(tk.END, "--- DECtalk Profiles ---")
             for profile_name in sorted(self.dectalk_profiles.keys()):
                 dectalk_label = f"[DECtalk] {profile_name}"
+                if dectalk_label in self.hidden_voices:
+                    continue
                 voice_names.append(dectalk_label)
                 voice_listbox.insert(tk.END, dectalk_label)
-        textaloud_names = self.extra_voice_names()
+        textaloud_names = [v for v in self.extra_voice_names() if v not in self.hidden_voices]
         if textaloud_names:
             voice_listbox.insert(tk.END, "")  # Separator
             voice_listbox.insert(tk.END, "--- More Voices ---")
@@ -4710,9 +4890,11 @@ OTHER
             voice_listbox.insert(tk.END, "--- DECtalk Profiles ---")
             for profile_name in sorted(self.dectalk_profiles.keys()):
                 dectalk_label = f"[DECtalk] {profile_name}"
+                if dectalk_label in self.hidden_voices:
+                    continue
                 voice_names.append(dectalk_label)
                 voice_listbox.insert(tk.END, dectalk_label)
-        textaloud_names = self.extra_voice_names()
+        textaloud_names = [v for v in self.extra_voice_names() if v not in self.hidden_voices]
         if textaloud_names:
             voice_listbox.insert(tk.END, "")  # Separator
             voice_listbox.insert(tk.END, "--- More Voices ---")
@@ -4830,9 +5012,11 @@ OTHER
                 voice_listbox.insert(tk.END, "--- DECtalk Profiles ---")
                 for profile_name in sorted(self.dectalk_profiles.keys()):
                     dectalk_label = f"[DECtalk] {profile_name}"
+                    if dectalk_label in self.hidden_voices:
+                        continue
                     voice_names.append(dectalk_label)
                     voice_listbox.insert(tk.END, dectalk_label)
-            textaloud_names = self.extra_voice_names()
+            textaloud_names = [v for v in self.extra_voice_names() if v not in self.hidden_voices]
             if textaloud_names:
                 voice_listbox.insert(tk.END, "")  # Separator
                 voice_listbox.insert(tk.END, "--- More Voices ---")
@@ -4932,7 +5116,7 @@ OTHER
         
         # Populate with voices
         if self.voices:
-            voice_names = [v.name for v in self.voices]
+            voice_names = [v.name for v in self.voices if v.name not in self.hidden_voices]
             self.announcement_voice_combo['values'] = voice_names
             # The saved choice, else Microsoft Sam, else the first voice (showing anything else here would get
             # saved over your choice by the next Save Announcements)
@@ -5347,6 +5531,8 @@ OTHER
             self.textaloud.shutdown()  # only if the TTS started it
         if getattr(self, 'piper', None):
             self.piper.shutdown()
+        if getattr(self, 'sapi4', None):
+            self.sapi4.shutdown()
         self.remember_window_size()
         self.save_config()
         self.root.destroy()
