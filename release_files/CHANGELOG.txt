@@ -7,6 +7,9 @@ v1.1.1
   being read out as brackets and numbers
 - One note after a [ - like [dah<2000,24>] - is enough for a message to count as DECtalk singing, wherever the
   note sits inside the brackets. A stray [ on its own or brackets around normal words still don't count.
+- DJ: YouTube songs play again. YouTube started refusing its audio links to anything but yt-dlp, so songs
+  started and ended at once; yt-dlp now fetches the audio itself and hands it to ffmpeg. If a song can't be
+  played, the DJ window says why (e.g. "This video is unavailable").
 
 
 v1.1.0 - changes since v1.0.0

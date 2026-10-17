@@ -644,22 +644,25 @@ class DJEngine:
 
         self.position = start
         source = track['target']
+        feeder = None  # yt-dlp fetching a YouTube song's audio for ffmpeg
         if track['source'] == 'youtube':
-            cached = track.get('_stream')
-            if cached and time.time() - cached[1] < 1800:
-                source = cached[0]  # looked up in the last 30 min (seek / bass change) - links last hours
-            else:
-                self.status = f"Loading {track['title']} from YouTube..."
-                info, error = self._youtube_info(source, stream_url=True)
-                if self._command:
-                    return self._command
-                if not info:
-                    self.status = f"Couldn't load {track['title']}: {error}"
-                    return 'error'
-                source = info['url']
-                track['_stream'] = (source, time.time())
-                if not track.get('duration') and info.get('duration'):
-                    track['duration'] = info['duration']
+            # YouTube refuses its audio links to anything but yt-dlp itself (403 Forbidden for ffmpeg, even with
+            # browser headers), so yt-dlp fetches the audio and hands it to ffmpeg through a pipe
+            ytdlp = self.ytdlp_path()
+            if not ytdlp:
+                self.status = "yt-dlp isn't installed - use Download yt-dlp in the DJ window"
+                return 'error'
+            self.status = f"Loading {track['title']} from YouTube..."
+            try:
+                feeder = subprocess.Popen(
+                    self._ytdlp_base(ytdlp) + ['--no-progress', '-f', 'bestaudio/best', '--no-playlist',
+                                               '-o', '-', '--', source],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                    creationflags=NO_WINDOW, env=dict(os.environ, PYTHONIOENCODING='utf-8'))
+            except OSError as e:
+                self.status = f"couldn't run yt-dlp: {e}"
+                return 'error'
+            source = 'pipe:0'
         elif track['source'] == 'subsonic':
             if not self.subsonic:
                 self.status = f"Can't play {track['title']}: not connected to your music server (DJ > My library)"
@@ -669,12 +672,16 @@ class DJEngine:
             self.status = f"File not found: {source}"
             return 'error'
 
-        cmd = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin']
-        if track['source'] in ('youtube', 'subsonic'):
+        cmd = [ffmpeg, '-hide_banner', '-loglevel', 'error']
+        if feeder is None:
+            cmd += ['-nostdin']
+        if track['source'] == 'subsonic':
             cmd += ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5']
-        if start > 0:
+        if start > 0 and feeder is None:
             cmd += ['-ss', f'{start:.2f}']
         cmd += ['-i', source, '-vn', '-sn', '-dn']
+        if start > 0 and feeder is not None:
+            cmd += ['-ss', f'{start:.2f}']  # a pipe can't jump ahead, so ffmpeg skips to the spot as it reads
         filters = []
         bass = float(self.get('bass_db') or 0)
         if bass:
@@ -686,18 +693,25 @@ class DJEngine:
         cmd += ['-f', 's16le', '-acodec', 'pcm_s16le', '-ac', str(CHANNELS), '-ar', str(RATE), 'pipe:1']
 
         errors = deque(maxlen=6)
+        feeder_errors = deque(maxlen=6)
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+                                    stdin=feeder.stdout if feeder else subprocess.DEVNULL, creationflags=NO_WINDOW)
         except OSError as e:
             self.status = f"Couldn't start ffmpeg: {e}"
+            if feeder:
+                feeder.kill()
             return 'stop'
         self._proc = proc
+        if feeder:
+            feeder.stdout.close()  # ffmpeg has it now; if ffmpeg stops, yt-dlp stops too
 
-        def drain_errors():  # keep ffmpeg's error output from filling its pipe and stalling it
-            for line in proc.stderr:
-                errors.append(line.decode('utf-8', 'replace').strip())
-        threading.Thread(target=drain_errors, daemon=True).start()
+        def drain_errors(pipe, lines):  # keep error output from filling its pipe and stalling the program
+            for line in pipe:
+                lines.append(line.decode('utf-8', 'replace').strip())
+        threading.Thread(target=drain_errors, args=(proc.stderr, errors), daemon=True).start()
+        if feeder:
+            threading.Thread(target=drain_errors, args=(feeder.stderr, feeder_errors), daemon=True).start()
 
         stream = None
         frames = 0
@@ -733,13 +747,29 @@ class DJEngine:
                 frames += len(data) // (CHANNELS * 2)
                 self.position = start + frames / RATE
             proc.wait(timeout=5)
-            if frames == 0 and proc.returncode not in (0, None):
-                self.status = f"Couldn't play {track['title']}: {errors[-1] if errors else 'ffmpeg error'}"
-                return 'error'
+            if frames == 0:
+                if feeder is not None:
+                    try:
+                        feeder.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    why = [l for l in feeder_errors if l.startswith('ERROR')]
+                    if why or feeder.returncode not in (0, None):
+                        reason = why[-1].replace('ERROR: ', '') if why else f"yt-dlp exit code {feeder.returncode}"
+                        self.status = f"Couldn't play {track['title']}: {reason}"
+                        return 'error'
+                if proc.returncode not in (0, None):
+                    self.status = f"Couldn't play {track['title']}: {errors[-1] if errors else 'ffmpeg error'}"
+                    return 'error'
             return 'ended'
         finally:
             self._kill_proc()
             self._proc = None
+            if feeder is not None and feeder.poll() is None:
+                try:
+                    feeder.kill()
+                except Exception:
+                    pass
             try:
                 proc.stdout.close()
             except Exception:
@@ -814,13 +844,10 @@ class DJEngine:
         exe = self.ytdlp_path()
         if not exe:
             return False, [], "yt-dlp isn't installed - use Download yt-dlp in the DJ window"
-        base = [exe, '--no-cache-dir', '--no-warnings', '--encoding', 'utf-8']
-        # YouTube now needs a JavaScript runtime; yt-dlp finds Deno by itself, Node has to be named
-        runtime = [] if shutil.which('deno') or not shutil.which('node') else ['--js-runtimes', 'node']
         env = dict(os.environ, PYTHONIOENCODING='utf-8')
-        for extra in (runtime, []):
+        for base in (self._ytdlp_base(exe), self._ytdlp_base(exe, runtime=False)):
             try:
-                proc = subprocess.Popen(base + extra + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                proc = subprocess.Popen(base + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                         stdin=subprocess.DEVNULL, creationflags=NO_WINDOW, env=env)
             except OSError as e:
                 return False, [], f"couldn't run yt-dlp: {e}"
@@ -838,11 +865,20 @@ class DJEngine:
             err_text = err.decode('utf-8', 'replace').strip()
             if proc.returncode == 0:
                 return True, [l for l in out.decode('utf-8', 'replace').splitlines() if l.strip()], ''
-            if extra and 'js-runtimes' in err_text:
-                continue  # older yt-dlp without that option: try again without it
+            if '--js-runtimes' in base and 'js-runtimes' in err_text:
+                self._old_ytdlp = True  # older yt-dlp without that option: from now on, without it
+                continue
             last = err_text.splitlines()[-1] if err_text else f"yt-dlp exit code {proc.returncode}"
             return False, [], last.replace('ERROR: ', '')
         return False, [], "yt-dlp failed"
+
+    def _ytdlp_base(self, exe, runtime=True):
+        """yt-dlp and the options it always gets. YouTube now needs a JavaScript runtime: yt-dlp finds Deno by
+        itself, Node has to be named (an old yt-dlp that doesn't know that option gets it left out)"""
+        base = [exe, '--no-cache-dir', '--no-warnings', '--encoding', 'utf-8']
+        if runtime and not getattr(self, '_old_ytdlp', False) and not shutil.which('deno') and shutil.which('node'):
+            base += ['--js-runtimes', 'node']
+        return base
 
     def _youtube_info(self, target, stream_url=False):
         """target: a URL or 'ytsearch1:words'. Returns ({title, duration, url, webpage_url, is_live}, error)."""
