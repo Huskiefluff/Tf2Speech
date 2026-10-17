@@ -4,6 +4,7 @@ Uses actual DECtalk say.exe for authentic voice synthesis
 """
 
 import os
+import re
 import sys
 import subprocess
 from temp_utils import get_temp_file, cleanup_old_temp_files, release_temp_file
@@ -51,6 +52,16 @@ def find_output_device(pa, device_name):
         if len(name) >= 12 and wanted.startswith(name.lower().strip()):
             return i, name
     return None, None
+
+
+def close_cut_off_phonemes(text):
+    """TF2 cuts long chat lines off, often in the middle of a song: "[llao<1000,26>...llao<400," with no closing ].
+    Close that last bracket after its last complete note (the half-written one is dropped) so DECtalk still sings
+    what's there instead of reading the brackets and numbers out loud."""
+    start = text.rfind('[')
+    if start == -1 or ']' in text[start:] or not re.search(r'<\d+(?:,\d+)?>', text[start:]):
+        return text
+    return text[:text.rfind('>') + 1] + ']'
 
 
 class DECtalkNative:
@@ -219,14 +230,14 @@ class DECtalkNative:
                 logger.warning(f"Unknown DECtalk profile: {voice_profile}")
         
         # Check if text contains Moonbase Alpha-style singing commands or phoneme commands
-        import re
-        
+        text = close_cut_off_phonemes(text)
+
         # Check for Moonbase Alpha style [<duration,pitch>]text patterns
         moonbase_pattern = r'\[<(\d+),(\d+)>\](\w+)'
         
         # Check for various phoneme patterns - be more flexible
         phoneme_patterns = [
-            r'\[[^\]]*<\d+(?:,\d+)?>\]',    # Match any phoneme pattern with <duration> or <duration,pitch>
+            r'\[[^\]]*<\d+(?:,\d+)?>[^\]]*\]',  # any [...] with a <duration> or <duration,pitch> note in it
             r'\[:t\d+,\d+\]',                # [:t timing commands]
             r'\[:dial\d+\]',                 # [:dial phone number]
             r'\[:phone\s+on\]',              # [:phone on] already present

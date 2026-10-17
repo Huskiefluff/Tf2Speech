@@ -381,6 +381,7 @@ DECtalk supports phoneme commands for songs and sound effects!
 - **New:** Chat soundboard (Sven Co-op ChatSounds style)
 - **New:** Help tab rewritten to match the real commands
 - Privacy: `tts_tf2.log` no longer contains what people say in chat (only line lengths, voices and names) and is capped at about 10 MB
+- DECtalk songs cut off by TF2's chat length limit are still sung instead of read out as text
 - **Hide / Unhide Selected** really hides voices now - from every voice list and from random voices
 - Muting or blocking someone cuts their current line off immediately (Windows voices too)
 - Admin commands still work for an admin who is muted

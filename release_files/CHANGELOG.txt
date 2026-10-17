@@ -28,6 +28,8 @@ FIXES
 - Privacy: tts_tf2.log no longer contains what people say in chat - only how long a line was, the voice and
   the player's name - and it's capped at about 10 MB (tts_tf2.log plus the previous one as tts_tf2.log.1).
   You can delete an old tts_tf2.log from v1.0.0, which may contain chat.
+- DECtalk songs cut off by TF2's chat length limit are still sung (the unfinished last note is dropped)
+  instead of being read out as brackets and numbers
 - Muting or blocking someone cuts their current line off immediately (Windows voices too)
 - Admin commands still work for an admin who is muted
 - "Hide / Unhide Selected" really hides voices - from every voice list and from random voices
