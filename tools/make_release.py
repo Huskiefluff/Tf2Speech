@@ -9,6 +9,7 @@ The zip lands in dist_release\TF2Speech_v1.1.0.zip. Nothing from dist\ except th
 logs, downloaded tools or voices).
 """
 
+import re
 import sys
 import hashlib
 import zipfile
@@ -151,6 +152,10 @@ def main():
     if len(sys.argv) != 2:
         sys.exit("usage: make_release.py <version>, e.g. 1.1.0")
     version = sys.argv[1]
+    src_version = re.search(r'APP_VERSION = "([^"]+)"', (ROOT / 'src' / 'version.py').read_text(encoding='utf-8'))
+    if not src_version or src_version.group(1) != version:
+        sys.exit(f"src/version.py says {src_version and src_version.group(1)} - set APP_VERSION to {version}, rebuild, "
+                 "then make the release (the updater compares this number with GitHub's)")
     if not EXE.exists():
         sys.exit(f"{EXE} not found - run build.bat first")
     out_dir = ROOT / 'dist_release'

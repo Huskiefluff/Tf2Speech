@@ -112,6 +112,9 @@ a = Analysis(
         'ui_theme',  # flat Light/Dark and Classic looks, scaling, scrolling tabs, smooth resizing
         'voice_installer',  # Voices tab: Windows' extra voices, free Piper voices
         'sapi4_voice',  # old SAPI 4 voices (Sam 4.0, TruVoice/BonziBuddy) via sapi4_tts.exe
+        'text_normalize',  # emoji and text smileys said by name, Piper spells abbreviations
+        'updater',  # new versions from the GitHub releases
+        'version',  # APP_VERSION
         'urllib.request',
         'array',
     ],

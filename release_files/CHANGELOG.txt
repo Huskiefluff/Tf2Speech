@@ -1,6 +1,22 @@
 TF2Speech v{version} - what's new
 ==============================
 
+v1.1.2
+------
+- Updates: TF2Speech now looks for a new version on GitHub when it starts. A bar at the top of the window (never
+  a pop-up) offers "Update now": it downloads the new version, checks it against GitHub's checksum, swaps it in
+  and restarts. Settings, voices, sounds and downloaded tools are kept; the old exe is kept as
+  TTS_TF2_64BIT.exe.old, and if tts.cfg changed, yours is kept as tts.cfg.old. Settings > Updates switches the
+  check off or runs it now. The check is a normal request to GitHub - nothing about you or your chat is sent.
+- Emoji and text smileys are said by name in every voice, the way Windows' David does it: 🙂 "slightly smiling
+  face", :) "smiley face", <3 "heart". A row of the same emoji is said once, and at most 8 per message.
+- Piper voices spell out short capital abbreviations (PST, GG, TF2, AFK) instead of saying them as words.
+- DJ: song requests for age-restricted YouTube videos are denied ("your request was denied, it's age
+  restricted") - TF2Speech never uses anyone's YouTube login.
+- Piper and the DJ's helper programs run at a lower priority, so TF2 always goes first (fewer micro-stutters
+  when someone talks in a Piper voice or a YouTube song starts).
+
+
 v1.1.1
 ------
 - DECtalk songs cut off by TF2's chat length limit are sung (the unfinished last note is dropped) instead of

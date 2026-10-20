@@ -26,7 +26,9 @@ tools they need into this folder the first time you use them - nothing is instal
 
 UPGRADING
 ---------
-- Extract this zip over your old one (it's the same "release" folder) - your config.json stays and is used.
+- From v1.1.2 on, TF2Speech updates itself: when a new version is out, a bar at the top of its window offers
+  "Update now" (your settings are kept). Settings > Updates switches the check off or runs it now.
+- From an older version: extract this zip over your old one (it's the same "release" folder) - your config.json stays and is used.
   Or copy config.json from your old folder into this one.
 - Coming from v1.0.0: copy the new tts.cfg into TF2's cfg folder again: it has new keys (mute, approve / deny /
   skip song) and optional "silent" versions of the keys. If you changed your own copy, move your changes over.

@@ -23,6 +23,7 @@ A spiritual successor to the original TF2Speech program, allowing players to com
 - **DJ** *(new)* - Play music from your PC, your Subsonic/Navidrome library or YouTube into voice chat, with a queue, ducking under TTS and chat song requests (with optional approval)
 - **Soundboard** *(new)* - Sven Co-op style chat sounds: type `yee`, everyone hears it
 - **More voices** *(new)* - Make Windows' extra voices usable, and download free natural-sounding [Piper](https://github.com/rhasspy/piper) voices in dozens of languages with one click
+- **Updates itself** *(new)* - Finds new releases on GitHub and updates with one click, keeping your settings
 - **Classic SAPI 4 voices** *(new, optional)* - If the old SAPI 4 voices are installed on your PC (Microsoft Sam 4.0, L&H TruVoice...), they work too - including a ready-made BonziBuddy voice
 - **TextAloud voices** *(new, optional)* - If you own TextAloud 3 voices (e.g. Acapela Will From Afar), TF2Speech can use them through TextAloud, completely hidden
 - **New look** *(new)* - A flat Light / Dark / Match Windows look, or the Classic look; every part resizes smoothly, tabs scroll instead of getting cut off, sharp at any Windows scaling
@@ -50,6 +51,8 @@ Nothing else needs installing. The DJ and soundboard use two free tools that TF2
 4. Run `TTS_TF2_64BIT.exe`
 
 Your settings are saved in `config.json` next to the exe.
+
+From v1.1.2 on, TF2Speech **updates itself**: when a new release is out, a bar at the top of its window offers **Update now** (see [Updates](#updates)).
 
 The zip also has `VOICES.txt` (every kind of voice TF2Speech can use and what the optional ones need), `CHANGELOG.txt` and the licences of everything built into the exe (`THIRD-PARTY-NOTICES.txt`).
 
@@ -293,6 +296,16 @@ Some voices sold for TextAloud 3 (for example Acapela "Will From Afar" bought fr
 
 ---
 
+## Updates
+
+When TF2Speech starts, it asks GitHub whether a newer release exists (a normal request to the GitHub API: no login, and nothing about you or your chat is sent). If there is one, a bar at the top of the window - never a pop-up, so it can't pull you out of a game - offers **Update now**, **What's new** and **Later**.
+
+- **Update now** downloads the release zip and checks it against the SHA-256 checksum GitHub publishes, so a broken or tampered download is never installed.
+- The new exe is swapped in (the old one is kept as `TTS_TF2_64BIT.exe.old`), and **Restart now** starts it. Settings, voices, sounds and downloaded tools are kept. If `tts.cfg` changed, yours is kept as `tts.cfg.old` - copy the new one into TF2's `cfg` folder.
+- **Settings → Updates** switches the start-up check off, or checks now.
+
+---
+
 ## Third-party tools
 
 The DJ, soundboard and Piper voices need a few free tools. They are **not** included in the download - TF2Speech fetches them for you the first time (one click) and keeps them next to the exe. Nothing is installed in Windows.
@@ -368,6 +381,16 @@ DECtalk supports phoneme commands for songs and sound effects!
 
 ### Something went wrong
 - Everything is logged to `tts_tf2.log` next to the exe (never what people say in chat)
+
+---
+
+## What's new in v1.1.2
+
+- **Updates:** TF2Speech checks GitHub for a new version when it starts and can update itself with one click (see [Updates](#updates))
+- Emoji and text smileys are said by name in every voice, like Windows' David does: 🙂 "slightly smiling face", `:)` "smiley face"
+- Piper voices spell out short capital abbreviations (PST, GG, TF2) instead of saying them as words
+- DJ: requests for age-restricted YouTube videos are denied with a short message - TF2Speech never uses anyone's YouTube login
+- Piper and the DJ's helper programs run at a lower priority, so TF2 always goes first (fewer micro-stutters)
 
 ---
 

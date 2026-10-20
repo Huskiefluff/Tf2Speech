@@ -75,6 +75,8 @@ CHANNELS = 2
 FRAMES_PER_CHUNK = 2048                       # ~43 ms of audio per write
 CHUNK_BYTES = FRAMES_PER_CHUNK * CHANNELS * 2  # 16-bit samples
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+# yt-dlp and ffmpeg run below normal priority, so the game always goes first (a song start can use a full core)
+LOW_PRIORITY = NO_WINDOW | getattr(subprocess, 'BELOW_NORMAL_PRIORITY_CLASS', 0)
 AUDIO_EXTENSIONS = {'.mp3', '.flac', '.m4a', '.aac', '.ogg', '.opus', '.wav', '.wma', '.webm', '.mp4', '.mka', '.aiff'}
 # Chat requests may only be YouTube links (or search words). Any other link would make this PC fetch a page a
 # stranger chose - an easy way for someone to grab your IP address.
@@ -106,6 +108,22 @@ DEFAULTS = {
     'approval_admins_skip': True, # ...except admins' requests
     'scrobble': False,            # tell the Subsonic server what was played (play counts)
 }
+
+# Age-restricted videos only play for a signed-in YouTube account; the DJ deliberately never uses anyone's login,
+# so they're skipped (and chat requests for them are denied)
+AGE_RESTRICTED = re.compile(r'confirm your age|age.restricted|inappropriate for some users', re.I)
+
+# yt-dlp's errors, said so the DJ knows what's going on
+FRIENDLY_ERRORS = [
+    (AGE_RESTRICTED, "age-restricted, skipped"),
+]
+
+
+def friendly_error(text):
+    for pattern, message in FRIENDLY_ERRORS:
+        if pattern.search(text or ''):
+            return message
+    return text
 
 
 def fmt_time(seconds):
@@ -221,6 +239,8 @@ class DJEngine:
         app_dir:      folder where yt-dlp.exe is kept (next to the TTS exe)
         """
         self.settings = settings
+        for removed in ('youtube_signin', 'youtube_cookies_file'):  # the YouTube sign-in option was taken out
+            settings.pop(removed, None)
         self._save_config = save_config
         self._tts_active = tts_active or (lambda: False)
         self._announce = announce or (lambda text, track: None)
@@ -655,10 +675,10 @@ class DJEngine:
             self.status = f"Loading {track['title']} from YouTube..."
             try:
                 feeder = subprocess.Popen(
-                    self._ytdlp_base(ytdlp) + ['--no-progress', '-f', 'bestaudio/best', '--no-playlist',
-                                               '-o', '-', '--', source],
+                    self._ytdlp_base(ytdlp)
+                    + ['--no-progress', '-f', 'bestaudio/best', '--no-playlist', '-o', '-', '--', source],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                    creationflags=NO_WINDOW, env=dict(os.environ, PYTHONIOENCODING='utf-8'))
+                    creationflags=LOW_PRIORITY, env=dict(os.environ, PYTHONIOENCODING='utf-8'))
             except OSError as e:
                 self.status = f"couldn't run yt-dlp: {e}"
                 return 'error'
@@ -696,7 +716,7 @@ class DJEngine:
         feeder_errors = deque(maxlen=6)
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    stdin=feeder.stdout if feeder else subprocess.DEVNULL, creationflags=NO_WINDOW)
+                                    stdin=feeder.stdout if feeder else subprocess.DEVNULL, creationflags=LOW_PRIORITY)
         except OSError as e:
             self.status = f"Couldn't start ffmpeg: {e}"
             if feeder:
@@ -755,7 +775,8 @@ class DJEngine:
                         pass
                     why = [l for l in feeder_errors if l.startswith('ERROR')]
                     if why or feeder.returncode not in (0, None):
-                        reason = why[-1].replace('ERROR: ', '') if why else f"yt-dlp exit code {feeder.returncode}"
+                        reason = friendly_error(why[-1].replace('ERROR: ', '')) if why \
+                            else f"yt-dlp exit code {feeder.returncode}"
                         self.status = f"Couldn't play {track['title']}: {reason}"
                         return 'error'
                 if proc.returncode not in (0, None):
@@ -848,7 +869,7 @@ class DJEngine:
         for base in (self._ytdlp_base(exe), self._ytdlp_base(exe, runtime=False)):
             try:
                 proc = subprocess.Popen(base + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                        stdin=subprocess.DEVNULL, creationflags=NO_WINDOW, env=env)
+                                        stdin=subprocess.DEVNULL, creationflags=LOW_PRIORITY, env=env)
             except OSError as e:
                 return False, [], f"couldn't run yt-dlp: {e}"
             if interruptible:
@@ -869,12 +890,13 @@ class DJEngine:
                 self._old_ytdlp = True  # older yt-dlp without that option: from now on, without it
                 continue
             last = err_text.splitlines()[-1] if err_text else f"yt-dlp exit code {proc.returncode}"
-            return False, [], last.replace('ERROR: ', '')
+            return False, [], friendly_error(last.replace('ERROR: ', ''))
         return False, [], "yt-dlp failed"
 
     def _ytdlp_base(self, exe, runtime=True):
         """yt-dlp and the options it always gets. YouTube now needs a JavaScript runtime: yt-dlp finds Deno by
-        itself, Node has to be named (an old yt-dlp that doesn't know that option gets it left out)"""
+        itself, Node has to be named (an old yt-dlp that doesn't know that option gets it left out).
+        Never any YouTube login or cookies: the DJ doesn't use anyone's account."""
         base = [exe, '--no-cache-dir', '--no-warnings', '--encoding', 'utf-8']
         if runtime and not getattr(self, '_old_ytdlp', False) and not shutil.which('deno') and shutil.which('node'):
             base += ['--js-runtimes', 'node']
@@ -1155,6 +1177,9 @@ class DJEngine:
                     deny(f"Couldn't find {query} in the library for {username}", "that isn't in the library")
                     return
             info, error = self._youtube_info(target)
+            if not info and error == friendly_error('age-restricted'):
+                deny(f"{username}'s request is age-restricted", "it's age restricted")
+                return
             if not info:
                 deny(f"Couldn't find a song for {username}" + (f" ({error})" if error else ""), "nothing was found")
                 return

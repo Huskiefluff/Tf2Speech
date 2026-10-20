@@ -11,6 +11,25 @@ import logging.handlers
 from pathlib import Path
 import traceback
 
+
+def wait_for_previous_copy():
+    """After an update the new copy is started with --wait-pid <old copy>: wait (at most 20 s) until the old copy
+    has closed, so the two never run at the same time or write the settings and log together"""
+    if '--wait-pid' not in sys.argv:
+        return
+    try:
+        import ctypes
+        pid = int(sys.argv[sys.argv.index('--wait-pid') + 1])
+        handle = ctypes.windll.kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if handle:
+            ctypes.windll.kernel32.WaitForSingleObject(handle, 20000)
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except (ValueError, IndexError, OSError, AttributeError):
+        pass
+
+
+wait_for_previous_copy()
+
 # Set up logging first
 if getattr(sys, 'frozen', False):
     log_dir = Path(sys.executable).parent

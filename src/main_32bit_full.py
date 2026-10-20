@@ -15,6 +15,7 @@ import shutil
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 import ui_theme  # Windows 11 look, dark mode, scaling, scrolling tabs
+from text_normalize import speakable, spell_abbreviations  # emoji/smileys said by name; Piper abbreviations
 from pathlib import Path
 import threading
 import queue
@@ -112,6 +113,15 @@ except Exception as e:
     VOICES_AVAILABLE = False
     PIPER_PREFIX = "[Piper] "
 
+
+try:
+    import updater  # new versions from the GitHub releases (Settings > Updates)
+    from version import APP_VERSION
+    UPDATER_AVAILABLE = True
+except Exception as e:
+    logger.warning(f"Updates not available: {e}")
+    UPDATER_AVAILABLE = False
+    APP_VERSION = "?"
 
 try:
     import sapi4_voice  # old SAPI 4 voices: Microsoft Sam 4.0, TruVoice (BonziBuddy)...
@@ -516,7 +526,17 @@ class TTSReplicaWASAPI:
         # Auto-generate voice commands if empty
         if not self.voice_commands or all(not v for v in self.voice_commands.values()):
             self.auto_generate_voice_commands()
-        
+
+        # Updates: look for a newer TF2Speech on GitHub a few seconds after start (Settings > Updates)
+        self.update_info = None
+        self.update_bar = None
+        logger.info(f"TF2Speech v{APP_VERSION}")
+        if UPDATER_AVAILABLE:
+            if updater.can_update():
+                updater.clean_up(updater.app_dir())
+            if self.config.get('check_updates', True):
+                self.root.after(8000, self.start_update_check)
+
     def init_audio(self):
         """Initialize WASAPI audio manager"""
         try:
@@ -1799,7 +1819,19 @@ class TTSReplicaWASAPI:
                                    values=['Match Windows', 'Light', 'Dark', 'Classic (original look)'])
         theme_combo.grid(row=9, column=1, sticky=tk.W, padx=10, pady=5)
         theme_combo.bind('<<ComboboxSelected>>', self.on_theme_changed)
-        
+
+        # Updates: TF2Speech asks GitHub for a newer version when it starts (or now)
+        ttk.Label(settings_frame, text="Updates").grid(row=11, column=0, sticky=tk.W, padx=10, pady=5)
+        update_row = ttk.Frame(settings_frame)
+        update_row.grid(row=11, column=1, columnspan=2, sticky=tk.W, padx=10, pady=5)
+        self.check_updates_var = tk.BooleanVar(value=self.config.get('check_updates', True))
+        ttk.Checkbutton(update_row, text="Check when TF2Speech starts", variable=self.check_updates_var,
+                        command=self.on_check_updates_changed).pack(side=tk.LEFT)
+        ttk.Button(update_row, text="Check now",
+                   command=lambda: self.start_update_check(manual=True)).pack(side=tk.LEFT, padx=8)
+        self.update_status_label = ttk.Label(update_row, text=f"You have v{APP_VERSION}", style='Hint.TLabel')
+        self.update_status_label.pack(side=tk.LEFT)
+
         ttk.Button(config_frame, text="Export Config", command=self.export_config).pack(side=tk.LEFT, padx=5, pady=5)
         ttk.Button(config_frame, text="Import Config", command=self.import_config).pack(side=tk.LEFT, padx=5, pady=5)
         ttk.Button(config_frame, text="Reset to Defaults", command=self.reset_config).pack(side=tk.LEFT, padx=5, pady=5)
@@ -2569,7 +2601,9 @@ OTHER
   Quick Speak: try a line out loud. Apply saves the Settings tab.
   Announcements tab: what the TTS says when someone is blocked, muted, requests a song...
   Auto Block tab: words that block a player automatically.
-  Appearance (Settings): Match Windows, Light or Dark. Drag the dividers to resize the sections."""
+  Appearance (Settings): Match Windows, Light or Dark. Drag the dividers to resize the sections.
+  Updates (Settings): TF2Speech looks for a new version on GitHub when it starts. A bar at the top offers
+    Update now - your settings, voices and sounds are kept."""
 
         help_text.configure(tabs=(self.px(260),))  # the columns below are tab-separated
         help_text.insert("1.0", help_content)
@@ -3419,7 +3453,9 @@ OTHER
                 
                 # Speak using async speech so it can be interrupted
                 if self.audio_manager:
-                    text_to_speak = msg['text']
+                    # Emoji and text smileys by name ("slightly smiling face"), like Windows' David says them -
+                    # every voice the same way, instead of silence or "question mark"
+                    text_to_speak = speakable(msg['text'])
                     current_voice = msg.get('voice')
                     
                     # If no voice specified in message, check if user has a DECtalk/TextAloud preference
@@ -3698,6 +3734,8 @@ OTHER
         player = getattr(self, 'dectalk_native', None)
         if not (self.piper and self.piper.available() and hasattr(player, '_play_wav')):
             return False
+        text = spell_abbreviations(text)  # Piper says "PST" as a word otherwise
+
         wav_path = get_temp_file(suffix='.wav', prefix='tts_piper_')
         player.stop_requested = False
 
@@ -5554,6 +5592,130 @@ OTHER
         self.save_config()
         messagebox.showinfo("Settings", "Settings applied!")
         
+    # ------------------------------------------------------------------ updates
+    def start_update_check(self, manual=False):
+        """Ask GitHub for a newer release in the background (at start-up if switched on, or Check now)"""
+        if not UPDATER_AVAILABLE or not (updater.can_update() or updater.TEST_URL):
+            if manual:
+                self.set_update_status("Updates work in the built program (TTS_TF2_64BIT.exe)")
+            return
+        if manual:
+            self.set_update_status("Checking...")
+
+        def work():
+            try:
+                info = updater.check()
+            except Exception as e:
+                logger.info(f"Update check failed: {e}")
+                if manual:
+                    self.run_on_gui(lambda: self.set_update_status("Couldn't reach GitHub - try again later"))
+                return
+            if not info:
+                logger.info(f"Update check: v{APP_VERSION} is the newest")
+                if manual:
+                    self.run_on_gui(lambda: self.set_update_status(f"You have the newest version (v{APP_VERSION})"))
+                return
+            logger.info(f"Update available: v{info['version']}")
+            self.run_on_gui(lambda: self.show_update_bar(info))
+        threading.Thread(target=work, daemon=True, name='Update check').start()
+
+    def set_update_status(self, text):
+        if getattr(self, 'update_status_label', None):
+            self.update_status_label.configure(text=text)
+
+    def on_check_updates_changed(self):
+        self.config['check_updates'] = bool(self.check_updates_var.get())
+        self.save_config()
+
+    def _update_bar(self):
+        """The bar at the top of the window that offers updates - never a pop-up, so it can't pull you out of a
+        game. Returns it emptied."""
+        if self.update_bar is None:
+            self.update_bar = ttk.Frame(self.content, padding=(self.px(8), self.px(4)))
+        for child in self.update_bar.winfo_children():
+            child.destroy()
+        if not self.update_bar.winfo_ismapped():
+            self.update_bar.pack(side=tk.TOP, fill=tk.X, before=self.side_paned)
+        return self.update_bar
+
+    def hide_update_bar(self):
+        if self.update_bar is not None:
+            self.update_bar.pack_forget()
+
+    def show_update_bar(self, info):
+        self.update_info = info
+        self.set_update_status(f"v{info['version']} is available")
+        bar = self._update_bar()
+        ttk.Label(bar, text=f"TF2Speech v{info['version']} is available (you have v{APP_VERSION}).").pack(side=tk.LEFT)
+        ttk.Button(bar, text="Update now", style='Accent.TButton', command=self.do_update).pack(side=tk.LEFT, padx=8)
+        ttk.Button(bar, text="What's new", command=lambda: self.open_release_page(info['page'])).pack(side=tk.LEFT)
+        ttk.Button(bar, text="Later", command=self.hide_update_bar).pack(side=tk.LEFT, padx=8)
+        if os.environ.get('TTS_UPDATE_AUTO') == '1':  # automatic test of the whole update
+            self.root.after(500, self.do_update)
+
+    def do_update(self):
+        """Download, check and install the new version; it takes over when TF2Speech restarts"""
+        info, folder = self.update_info, updater.app_dir()
+        self._update_cancel = False
+        bar = self._update_bar()
+        status = ttk.Label(bar, text=f"Downloading v{info['version']}...")
+        status.pack(side=tk.LEFT)
+        ttk.Button(bar, text="Cancel", command=lambda: setattr(self, '_update_cancel', True)).pack(side=tk.LEFT, padx=8)
+        shown = [0.0]
+
+        def progress(done, total):
+            if time.time() - shown[0] < 0.3 and done != total:
+                return
+            shown[0] = time.time()
+            text = (f"Downloading v{info['version']}... {done / 1e6:.0f} of {total / 1e6:.0f} MB" if total
+                    else f"Downloading v{info['version']}... {done / 1e6:.0f} MB")
+            self.run_on_gui(lambda: status.winfo_exists() and status.configure(text=text))
+
+        def work():
+            try:
+                zip_path = updater.download(info, folder, progress, lambda: self._update_cancel)
+                cfg_changed = updater.install(zip_path, folder)
+            except Exception as e:
+                logger.error(f"Update failed: {e}")
+                self.run_on_gui(lambda: self.update_failed(info, e))
+                return
+            logger.info(f"Update to v{info['version']} installed - takes over when TF2Speech restarts")
+            self.run_on_gui(lambda: self.update_ready(info, cfg_changed))
+        threading.Thread(target=work, daemon=True, name='Update download').start()
+
+    def update_ready(self, info, cfg_changed):
+        bar = self._update_bar()
+        text = f"v{info['version']} is installed - restart TF2Speech to start using it."
+        if cfg_changed:
+            text += " tts.cfg changed too: copy the new one into TF2's cfg folder (yours is kept as tts.cfg.old)."
+        ttk.Label(bar, text=text, wraplength=self.px(620)).pack(side=tk.LEFT)
+        ttk.Button(bar, text="Restart now", style='Accent.TButton', command=self.restart_after_update).pack(side=tk.LEFT, padx=8)
+        ttk.Button(bar, text="Later", command=self.hide_update_bar).pack(side=tk.LEFT)
+        self.set_update_status(f"v{info['version']} installed - restart to use it")
+        if os.environ.get('TTS_UPDATE_AUTO') == '1':
+            self.root.after(500, self.restart_after_update)
+
+    def update_failed(self, info, error):
+        bar = self._update_bar()
+        ttk.Label(bar, text=f"Update failed: {error}", wraplength=self.px(620)).pack(side=tk.LEFT)
+        ttk.Button(bar, text="Download page", command=lambda: self.open_release_page(info['page'])).pack(side=tk.LEFT, padx=8)
+        ttk.Button(bar, text="Close", command=self.hide_update_bar).pack(side=tk.LEFT)
+        self.set_update_status("Update failed - see the bar at the top")
+
+    def restart_after_update(self):
+        try:
+            updater.restart(updater.app_dir())
+        except OSError as e:
+            logger.error(f"Couldn't start the new version: {e}")
+            self.update_failed(self.update_info, f"couldn't start the new version ({e}) - start TF2Speech yourself")
+            return
+        self.on_closing()
+
+    def open_release_page(self, url):
+        import webbrowser
+        if url.startswith(f'https://github.com/{updater.REPO}/'):
+            webbrowser.open(url)
+
     def run(self):
         """Run the application"""
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)

@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 ONECORE_KEY = r"SOFTWARE\Microsoft\Speech_OneCore\Voices\Tokens"
 SAPI_KEY = r"SOFTWARE\Microsoft\Speech\Voices\Tokens"
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+# Piper uses several CPU cores for a second per line; at below-normal priority the game always goes first
+# (measured: same speed, no game hitches)
+LOW_PRIORITY = NO_WINDOW | getattr(subprocess, 'BELOW_NORMAL_PRIORITY_CLASS', 0)
 
 
 # ---------------------------------------------------------------- Windows (OneCore) voices
@@ -341,7 +344,7 @@ class PiperVoices:
             exe = piper_exe(self.voices_dir)
             proc = subprocess.Popen([str(exe), '-m', str(model), '--json-input', '-q'], cwd=str(exe.parent),
                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                    creationflags=NO_WINDOW, text=True, encoding='utf-8', bufsize=1)
+                                    creationflags=LOW_PRIORITY, text=True, encoding='utf-8', bufsize=1)
             entry = [proc, threading.Lock(), time.time()]
             self.procs[key] = entry
             if self._watch is None:
