@@ -156,6 +156,10 @@ a = Analysis(
     noarchive=False,
 )
 
+# Windows' own runtime pieces (api-ms-win-*.dll, ucrtbase.dll) come with Windows 10/11. Leave them out even when
+# another program on PATH carries copies (e.g. UVtools), so the exe doesn't change with what's installed here.
+a.binaries = [b for b in a.binaries if not (b[0].lower().startswith('api-ms-win-') or b[0].lower() == 'ucrtbase.dll')]
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(

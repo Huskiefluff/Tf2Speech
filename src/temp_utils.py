@@ -54,7 +54,10 @@ def get_temp_file(suffix='', prefix='tts_'):
     Returns the full path to the temp file.
     """
     temp_dir = get_temp_dir()
-    
+    # The folder sits in Windows' Temp folder, which Windows' own clean-up (Storage Sense / Disk Cleanup) may
+    # empty while the TTS is running - make it again instead of failing every line until a restart
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
     # Create temp file in our directory
     fd, path = tempfile.mkstemp(suffix=suffix, prefix=prefix, dir=str(temp_dir))
     os.close(fd)  # Close the file descriptor

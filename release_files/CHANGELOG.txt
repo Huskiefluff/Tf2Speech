@@ -1,6 +1,14 @@
 TF2Speech v{version} - what's new
 ==============================
 
+v1.1.3
+------
+- DECtalk no longer stops working after TF2Speech has been open for a while. Its sound files go in a
+  folder inside Windows' Temp folder, and Windows' own clean-up (Storage Sense / Disk Cleanup) can delete
+  that folder while TF2Speech runs - after that every DECtalk line failed until a restart. The folder is now
+  made again whenever it's missing.
+
+
 v1.1.2
 ------
 - Updates: TF2Speech now looks for a new version on GitHub when it starts. A bar at the top of the window (never

@@ -384,6 +384,12 @@ DECtalk supports phoneme commands for songs and sound effects!
 
 ---
 
+## What's new in v1.1.3
+
+- DECtalk no longer stops working after TF2Speech has been open for a while: Windows' own Temp clean-up could delete the folder its sound files go in, and every DECtalk line failed until a restart. The folder is now made again whenever it's missing.
+
+---
+
 ## What's new in v1.1.2
 
 - **Updates:** TF2Speech checks GitHub for a new version when it starts and can update itself with one click (see [Updates](#updates))
